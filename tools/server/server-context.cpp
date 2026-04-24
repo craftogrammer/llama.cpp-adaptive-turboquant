@@ -636,6 +636,10 @@ private:
 
     int32_t n_ctx; // total context for all clients / slots
 
+    // set to llama_model_n_swa(model)
+    // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
+    int32_t n_swa;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -805,6 +809,8 @@ private:
                 SRV_WRN("%s\n", "swa_full is not supported by this model, it will be disabled");
             }
         }
+
+        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -2440,9 +2446,6 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
-                            // note: when n_swa == 0, the model does not use SWA
-                            const auto n_swa = std::max(0, llama_model_n_swa(model));
-
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa);
 
@@ -2613,14 +2616,14 @@ private:
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
-                    // - the model uses SWA and we are not using `swa_full`
+                    // - the model uses SWA and we are not using `swa_full` (cached as n_swa, see above)
                     // - the model architecture is marked as recurrent or hybrid
                     //
                     // TODO: try to make this conditional on the context or the memory module, instead of the model type
                     do_checkpoint = do_checkpoint && (
                             llama_model_is_recurrent(model) ||
                             llama_model_is_hybrid(model) ||
-                            (llama_model_n_swa(model) > 0 && !params_base.swa_full)
+                            (n_swa > 0)
                             );
 
                     bool has_mtmd = false;
