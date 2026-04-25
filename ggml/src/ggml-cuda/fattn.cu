@@ -293,6 +293,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // Turbo3 symmetric (primary target for --cache-type-k turbo3 --cache-type-v turbo3)
     FATTN_VEC_CASES_ALL_D_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
 
+    // Turbo2 symmetric (--cache-type-k turbo2 --cache-type-v turbo2). Per fork README,
+    // fastest decode at every depth on every tested GPU. Boundary V auto-activates
+    // (LAYER_ADAPTIVE mode 12) when V is turbo2 in llama-kv-cache.cpp.
+    FATTN_VEC_CASES_ALL_D_TURBO(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+
     // Mixed turbo3_0 x q8_0: required by TURBO_LAYER_ADAPTIVE modes that promote
     // per-layer V (or K) to q8_0 while keeping the other side at turbo3.
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
@@ -302,6 +307,14 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // TCQ template instance only covers D=128 and D=256, not 64/512.
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
     FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+
+    // TCQ x q8_0 mixed pairs: enables LAYER_ADAPTIVE alongside TCQ KV. Same D=128/256
+    // limitation as TCQ symmetric. Block size mismatch (52B TCQ vs 34B q8_0) is fine
+    // because K and V tensors have separate strides.
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)
 
     GGML_ABORT("fatal error");
 }

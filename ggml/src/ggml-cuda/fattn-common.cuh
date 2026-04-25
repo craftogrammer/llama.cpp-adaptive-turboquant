@@ -359,8 +359,9 @@ static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
 
 // Turbo2 KQ dot product: dequantize K from turbo2 blocks, dot with q8_1 Q.
 // Same structure as turbo3 but reads 2-bit indices from qs only (no signs).
+// __noinline__: same Windows ptxas SM120 workaround as the turbo3 helpers.
 template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
+static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_turbo2_0 * K_turbo = (const block_turbo2_0 *) K_c;
@@ -962,8 +963,9 @@ static __device__ __noinline__ void dequantize_V_turbo3_0(const void * __restric
 }
 
 // Turbo2 V dequantize: extract `ne` float/half values at position i0.
+// __noinline__: same Windows ptxas SM120 workaround as the turbo3 helpers.
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __noinline__ void dequantize_V_turbo2_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo2_0 * x = (const block_turbo2_0 *) vx;
 
     const int64_t ib   = i0 / QK_TURBO2;

@@ -131,8 +131,20 @@ if (CUDAToolkit_FOUND)
             # TCQ variant: trellis-coded 3-bit, 3.25 bpv (+4% vs turbo3_0), potentially
             # better quality at similar size. Enables --cache-type-k/v turbo3_tcq.
             template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu
+            # TCQ x q8_0 mixed pairs: enables LAYER_ADAPTIVE modes alongside TCQ KV.
+            # Gemma 4 garbage output (spiritbuun issue #12) is head_dim=512 specific
+            # (FWHT-128 mismatch); doesn't apply to Qwen3.6's head_dim=256.
+            template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo3_tcq.cu
+            # turbo2_0: 2-bit scalar quant, ~7.53x compression. Per fork README, fastest
+            # at every depth on every tested GPU. Boundary V auto-activates (mode 12) for
+            # turbo2-V via llama-kv-cache.cpp. Worth trying for higher-context workloads.
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
             # EXCLUDED: bf16 template instances cause ptxas ACCESS_VIOLATION on SM120 with CUDA 12.8.2.
-            # Other turbo cross-types excluded to keep the build focused.
+            # turbo4_0 also excluded — known NaN regression on Qwen3.5-9B (issue #60),
+            # garbled output on SM120 (issue #56), SET_ROWS hardcoded for turbo3 packing
+            # (issue #29). TCQ x q8_0 mixed pairs blocked per spiritbuun PR #1 (cross-type
+            # crashes / garbage output, issue #12).
             # - fattn-vec-instance-bf16-*.cu (all 7 files)
             # - fattn-vec-instance-*-bf16.cu (all 6 files)
         )
@@ -146,12 +158,26 @@ if (CUDAToolkit_FOUND)
     # - Benchmarked: at -O0 on turbo3_0 TU we get ~36 t/s decode on Qwen3.6-27B
     #   at 140k context — matches original baseline, so no further tuning needed.
     set_source_files_properties(
+        # fattn.cu itself is the vec FA dispatch table. With many template specializations
+        # (turbo3, turbo2, TCQ, mixed pairs) the analyzer footprint exceeds Windows ptxas
+        # capacity at -O3 -> ACCESS_VIOLATION. -O0 here is essentially free at runtime
+        # (this TU is only routing logic, not the kernel hot path).
+        fattn.cu
         template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
         template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu
         # Asymmetry: K=turbo3_0 x V=q8_0 crashes ptxas (KQ-side analyzer weight),
         # but K=q8_0 x V=turbo3_0 builds fine at -O3. So only the turbo3_0-q8_0
         # direction needs the -O0 fallback; q8_0-turbo3_0 stays optimized.
         template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+        # turbo2_0: preemptive -O0 — body is similar weight to turbo3_0 (4 centroid
+        # lookups, bit-shift decode), so ptxas analyzer is likely to crash at -O3.
+        template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+        # TCQ x q8_0 mixed pairs: preemptive -O0 — TCQ K side carries the heavy
+        # 9-bit codebook lookup, same analyzer pressure as turbo3_0 x q8_0 which
+        # already needs -O0. q8_0 x turbo3_tcq direction may be safe at -O3 (q8_0 K
+        # path is light), but include it preemptively; can drop if it builds clean.
+        template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu
+        template-instances/fattn-vec-instance-q8_0-turbo3_tcq.cu
         PROPERTIES COMPILE_FLAGS "--ptxas-options=-O0")
 
     ggml_add_backend_library(ggml-cuda
