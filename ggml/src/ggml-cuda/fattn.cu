@@ -223,6 +223,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(512, type_K, type_V)              \
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // One-shot env-var init for TURBO_SPARSE_V_THRESHOLD. Free function (declared
+    // in fattn-vec.cuh) does the parse + cudaMemcpyToSymbol on first call only;
+    // subsequent calls are a single load. Kept out of the templated path to avoid
+    // bloating fattn-vec instances (ptxas analyzer is fragile on sm_120).
+    turbo_sparse_v_threshold_init();
+
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
