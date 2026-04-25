@@ -1749,6 +1749,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         set_rows_cuda_turbo1_5<idx_t>(ctx, src0, src1, dst);
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         load_tcq_norm_alpha();
+        // InnerQ: fixed 128-element FWHT group on TCQ path (matches turbo4 precedent at line 1245).
+        turbo_innerq_check_finalize(128, ne00);
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
@@ -1775,8 +1777,17 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
             }
         }
+        // Attention sinks: capture WHT-rotated fp16 for positions < TURBO_SINK_SIZE.
+        // TCQ uses fixed 128-element FWHT (matches turbo4 precedent at line 1261).
+        turbo_sink_capture_turbo3_impl<idx_t>(
+            src0_d, src1_d, dst->data,
+            ne00, ne01, ne11, s01_f, s02_f, s03_f,
+            ne12, ne13, s10_i, s11_i, s12_i,
+            nb1, nb2, nb3, 128, stream);
     } else if (dst->type == GGML_TYPE_TURBO2_TCQ) {
         load_tcq_norm_alpha();
+        // InnerQ: fixed 128-element FWHT group on TCQ path (matches turbo4 precedent at line 1245).
+        turbo_innerq_check_finalize(128, ne00);
         GGML_ASSERT(ne00 % QK_TURBO2_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO2_TCQ;
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
@@ -1803,6 +1814,13 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                     ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
             }
         }
+        // Attention sinks: capture WHT-rotated fp16 for positions < TURBO_SINK_SIZE.
+        // TCQ uses fixed 128-element FWHT (matches turbo4 precedent at line 1261).
+        turbo_sink_capture_turbo3_impl<idx_t>(
+            src0_d, src1_d, dst->data,
+            ne00, ne01, ne11, s01_f, s02_f, s03_f,
+            ne12, ne13, s10_i, s11_i, s12_i,
+            nb1, nb2, nb3, 128, stream);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }

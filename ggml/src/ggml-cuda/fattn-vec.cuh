@@ -428,11 +428,27 @@ static __global__ void flash_attn_ext_vec(
                         sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                     }
                 } else if constexpr (type_K == GGML_TYPE_TURBO3_TCQ) {
-                    sum = vec_dot_fattn_vec_KQ_turbo3_tcq_cb<D, nthreads_KQ>(
-                        K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                    // Sink fast-path: positions < TURBO_SINK_SIZE use captured fp16 K
+                    // (matches turbo3_0 pattern at the top of this if/else chain).
+                    const int kv_pos = k_VKQ_0 + i_KQ;
+                    if (d_fattn_sink_n > 0 && kv_pos < d_fattn_sink_n && d_fattn_sink_K_buf != nullptr) {
+                        const int kv_head = head / gqa_ratio;
+                        const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
+                        sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    } else {
+                        sum = vec_dot_fattn_vec_KQ_turbo3_tcq_cb<D, nthreads_KQ>(
+                            K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                    }
                 } else if constexpr (type_K == GGML_TYPE_TURBO2_TCQ) {
-                    sum = vec_dot_fattn_vec_KQ_turbo2_tcq_cb<D, nthreads_KQ>(
-                        K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                    const int kv_pos = k_VKQ_0 + i_KQ;
+                    if (d_fattn_sink_n > 0 && kv_pos < d_fattn_sink_n && d_fattn_sink_K_buf != nullptr) {
+                        const int kv_head = head / gqa_ratio;
+                        const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
+                        sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    } else {
+                        sum = vec_dot_fattn_vec_KQ_turbo2_tcq_cb<D, nthreads_KQ>(
+                            K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                    }
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                 }
@@ -737,7 +753,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     // Uses __device__ variables updated via cudaGetSymbolAddress + cudaMemcpyAsync
     // (graph-capturable). Previous __managed__ approach crashed on SM86.
     if constexpr (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
-                  type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO1_5) {
+                  type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO1_5 ||
+                  type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ) {
         const int ss = turbo_sink_size();
         if (ss > 0) {
             const ggml_tensor * K = dst->src[1];
