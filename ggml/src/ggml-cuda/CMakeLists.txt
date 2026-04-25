@@ -140,6 +140,13 @@ if (CUDAToolkit_FOUND)
             # at every depth on every tested GPU. Boundary V auto-activates (mode 12) for
             # turbo2-V via llama-kv-cache.cpp. Worth trying for higher-context workloads.
             template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+            # turbo2_0 x q8_0 mixed pairs: required for auto-mode-12 to actually fire
+            # without aborting. Without these instances, llama-kv-cache.cpp:212's
+            # boundary-V-to-q8_0 promotion crashes when dispatched. With them, V on
+            # first/last attention layers gets the wider q8_0 representation, while
+            # interior V layers stay at 2-bit turbo2.
+            template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
             # EXCLUDED: bf16 template instances cause ptxas ACCESS_VIOLATION on SM120 with CUDA 12.8.2.
             # turbo4_0 also excluded — known NaN regression on Qwen3.5-9B (issue #60),
             # garbled output on SM120 (issue #56), SET_ROWS hardcoded for turbo3 packing
@@ -178,6 +185,12 @@ if (CUDAToolkit_FOUND)
         # path is light), but include it preemptively; can drop if it builds clean.
         template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu
         template-instances/fattn-vec-instance-q8_0-turbo3_tcq.cu
+        # turbo2_0 x q8_0 mixed pairs: preemptive -O0 — turbo2_0 K-side analyzer
+        # weight matches turbo2_0-turbo2_0 (which is already -O0). The q8_0-turbo2_0
+        # direction may be safe at -O3 (q8_0 K path is light, turbo3_0-q8_0's reverse
+        # builds fine without it); include it preemptively, can drop if clean.
+        template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+        template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
         PROPERTIES COMPILE_FLAGS "--ptxas-options=-O0")
 
     ggml_add_backend_library(ggml-cuda

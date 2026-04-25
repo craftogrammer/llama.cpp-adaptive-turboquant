@@ -303,6 +303,13 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0)
 
+    // Mixed turbo2_0 x q8_0: unlocks auto-mode-12 (boundary V promotion to q8_0
+    // on first/last attention layers) for the turbo2 SHIP config. Without this
+    // pair, llama-kv-cache.cpp:212's auto-enable would dispatch into a missing
+    // template instance and abort.
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0)
+
     // Turbo3 TCQ symmetric (--cache-type-k turbo3_tcq --cache-type-v turbo3_tcq).
     // TCQ template instance only covers D=128 and D=256, not 64/512.
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
