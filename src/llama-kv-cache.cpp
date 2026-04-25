@@ -5,6 +5,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -21,10 +23,10 @@
 #endif
 
 #ifdef GGML_USE_CUDA
-extern bool  g_innerq_finalized;
-extern float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
-extern bool turbo_innerq_needs_tensor_update(void);
-extern void turbo_innerq_mark_tensor_updated(void);
+GGML_BACKEND_API bool  g_innerq_finalized;
+GGML_BACKEND_API float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
+GGML_BACKEND_API bool turbo_innerq_needs_tensor_update(void);
+GGML_BACKEND_API void turbo_innerq_mark_tensor_updated(void);
 #else
 static bool  g_innerq_finalized = false;
 static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};

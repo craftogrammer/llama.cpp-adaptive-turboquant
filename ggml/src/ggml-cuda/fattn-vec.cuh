@@ -170,12 +170,8 @@ static __global__ void flash_attn_ext_vec(
     }
 
     // Sparse V: skip V dequant for positions with negligible attention weights.
-    // At long context, most V positions contribute < 1e-6 to the output — skipping
-    // their dequant saves significant compute (especially for quantized V types).
-    // Lower-precision V types tolerate more aggressive thresholds (less info in skipped values).
-    constexpr bool V_is_low_bpv = (type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO1_5 ||
-                                   type_V == GGML_TYPE_TURBO2_TCQ);
-    constexpr float sparse_v_threshold_f = V_is_low_bpv ? 1e-2f : 5e-3f;
+    // Keep the validated conservative threshold to avoid quality regressions.
+    constexpr float sparse_v_threshold_f = 1e-6f;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     const     half  sparse_v_threshold_h = __float2half(sparse_v_threshold_f);
 #endif
@@ -767,7 +763,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
                 int64_t      ne0;
                 int          n;
             };
-            static __attribute__((aligned(16))) sink_async_state sink_state;
+            static sink_async_state sink_state;
             sink_state = {k_buf_const, k_ne0_full, ss};
             CUDA_CHECK(cudaMemcpyAsync(d_addr_buf, &sink_state.buf, sizeof(const half *), cudaMemcpyHostToDevice, ctx.stream()));
             CUDA_CHECK(cudaMemcpyAsync(d_addr_ne0, &sink_state.ne0, sizeof(int64_t),      cudaMemcpyHostToDevice, ctx.stream()));

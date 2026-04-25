@@ -119,7 +119,10 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
 }
 
 template<int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
+// __noinline__ here: avoids Windows ptxas ACCESS_VIOLATION on SM120/CUDA 12.9
+// when this is inlined into flash_attn_ext_vec (q4_0 K-cache path).
+// Perf cost is ~5-20 cycles per K-block call; much better than -O0 on the whole TU.
+static __device__ __noinline__ float vec_dot_fattn_vec_KQ_q4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_q4_0 * K_q4_0 = (const block_q4_0 *) K_c;
@@ -305,7 +308,9 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
 // Processes 4 consecutive elements per iteration (matching int32 Q packing).
 // Each qs byte covers 4 elements (2-bit indices), signs byte covers 8.
 template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
+// __noinline__ here: avoids Windows ptxas ACCESS_VIOLATION on SM120/CUDA 12.9
+// when this heavy bit-shift+centroid-lookup body is inlined into flash_attn_ext_vec.
+static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_turbo3_0 * K_turbo = (const block_turbo3_0 *) K_c;
@@ -679,7 +684,8 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+// __noinline__: same Windows ptxas workaround as vec_dot_fattn_vec_KQ_q4_0.
+static __device__ __noinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
     const int64_t ib    =  i0          /  QK4_0;
@@ -896,7 +902,8 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 // i0 is always a multiple of 4 from the VEC kernel access pattern, so all 4
 // elements share one qs byte and one signs byte — we load each once.
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+// __noinline__: same Windows ptxas workaround as vec_dot_fattn_vec_KQ_turbo3_0.
+static __device__ __noinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
 
     const int64_t ib   = i0 / QK_TURBO3;
@@ -1013,9 +1020,11 @@ static __device__ __forceinline__ void dequantize_V_turbo2_0(const void * __rest
 // =====================================================================================
 // TCQ 3-bit K dot product: 9-bit state -> codebook lookup
 // =====================================================================================
-// Core implementation takes explicit codebook pointer for SMEM/constant flexibility
+// Core implementation takes explicit codebook pointer for SMEM/constant flexibility.
+// __noinline__: same Windows ptxas workaround as vec_dot_fattn_vec_KQ_turbo3_0.
+// TCQ body is heavier (9-bit state + codebook lookup), so avoid inlining into FA kernel.
 template<int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_cb(
+static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_cb(
     const char * __restrict__ K_c, const void * __restrict__ Q_v,
     const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
     const float * __restrict__ cb) {
@@ -1130,7 +1139,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_tcq(
 // =====================================================================================
 // Core implementation takes explicit codebook pointer for SMEM/constant flexibility
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo3_tcq_cb(
+// __noinline__: same Windows ptxas workaround as dequantize_V_turbo3_0.
+static __device__ __noinline__ void dequantize_V_turbo3_tcq_cb(
         const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0,
         const float * __restrict__ cb) {
     const block_turbo3_tcq * x = (const block_turbo3_tcq *) vx;

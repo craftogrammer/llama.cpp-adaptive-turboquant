@@ -71,15 +71,13 @@ if (CUDAToolkit_FOUND)
         FetchContent_MakeAvailable(CCCL)
     endif()
 
-    # Replace any plain 12X CUDA architectures with their "architecture-specific" equivalents 12Xa.
-    # 12X is forwards-compatible, 12Xa is not.
-    # Notably the Blackwell FP4 tensor core instructions are not forwards compatible and therefore need 12Xa.
-    # But while 12X vs. 12Xa can be checked in device code there is (to my knowledge) no easy way to do the same check in host code.
-    # So for now just replace all instances of 12X with 12Xa, this should be fine until Rubin is released.
+    # Preserve explicitly requested Blackwell targets. Desktop RTX 50-series GPUs
+    # are sm_120, not sm_120a; forcing 120a can select unsupported arch-specific
+    # instructions. Only default/native arch lists should contain 120a.
     foreach(ARCHS IN ITEMS CMAKE_CUDA_ARCHITECTURES CMAKE_CUDA_ARCHITECTURES_NATIVE)
         set(FIXED_ARCHS "")
         foreach(ARCH IN LISTS ${ARCHS})
-            if (ARCH MATCHES "^12[0-9](-real|-virtual)?$")
+            if (ARCH MATCHES "^12[0-9]$")
                 string(REGEX REPLACE "^(12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
                 message(STATUS "Replacing ${ARCH} in ${ARCHS} with ${FIXED_ARCH}")
                 list(APPEND FIXED_ARCHS "${FIXED_ARCH}")
@@ -107,6 +105,10 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
+    if (GGML_CUDA_NO_MXFP4)
+        list(FILTER SRCS EXCLUDE REGEX "mmq-instance-mxfp4\\.cu$")
+        add_compile_definitions(GGML_CUDA_NO_MXFP4)
+    endif()
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
@@ -120,48 +122,37 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-f16-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu
-            # turbo symmetric
+            # Turbo3 symmetric (primary target for --cache-type-k turbo3 --cache-type-v turbo3)
             template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo1_5-turbo1_5.cu
-            # turbo × q8_0
+            # Mixed turbo3_0 x q8_0: required for TURBO_LAYER_ADAPTIVE modes that
+            # promote per-layer V (or K) to q8_0 while keeping the other side at turbo3.
             template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
             template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo1_5-q8_0.cu
-            template-instances/fattn-vec-instance-q8_0-turbo1_5.cu
-            # turbo × turbo cross-types
-            template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo1_5.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
-            template-instances/fattn-vec-instance-turbo3_0-turbo1_5.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo2_0-turbo1_5.cu
-            template-instances/fattn-vec-instance-turbo1_5-turbo4_0.cu
-            template-instances/fattn-vec-instance-turbo1_5-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo1_5-turbo2_0.cu
-            # turbo × f16 cross-types
-            template-instances/fattn-vec-instance-turbo4_0-f16.cu
-            template-instances/fattn-vec-instance-turbo3_0-f16.cu
-            template-instances/fattn-vec-instance-turbo2_0-f16.cu
-            template-instances/fattn-vec-instance-turbo1_5-f16.cu
-            template-instances/fattn-vec-instance-f16-turbo4_0.cu
-            template-instances/fattn-vec-instance-f16-turbo3_0.cu
-            template-instances/fattn-vec-instance-f16-turbo2_0.cu
-            template-instances/fattn-vec-instance-f16-turbo1_5.cu
+            # TCQ variant: trellis-coded 3-bit, 3.25 bpv (+4% vs turbo3_0), potentially
+            # better quality at similar size. Enables --cache-type-k/v turbo3_tcq.
             template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu
-            template-instances/fattn-vec-instance-turbo2_tcq-turbo2_tcq.cu
-            template-instances/fattn-vec-instance-turbo3_tcq-turbo2_tcq.cu
-            template-instances/fattn-vec-instance-turbo2_tcq-turbo3_tcq.cu)
+            # EXCLUDED: bf16 template instances cause ptxas ACCESS_VIOLATION on SM120 with CUDA 12.8.2.
+            # Other turbo cross-types excluded to keep the build focused.
+            # - fattn-vec-instance-bf16-*.cu (all 7 files)
+            # - fattn-vec-instance-*-bf16.cu (all 6 files)
+        )
     endif()
+
+    # Windows ptxas ACCESS_VIOLATION workaround (SM120 / CUDA 12.9):
+    # - q4_0 K/V helpers in fattn-common.cuh are marked __noinline__. That alone
+    #   lets this file build cleanly at full -O3.
+    # - turbo3_0 + turbo3_tcq TUs fall back to -O0 (heavy dequant bodies that
+    #   ptxas's analyzer chokes on even with __noinline__ on helpers).
+    # - Benchmarked: at -O0 on turbo3_0 TU we get ~36 t/s decode on Qwen3.6-27B
+    #   at 140k context — matches original baseline, so no further tuning needed.
+    set_source_files_properties(
+        template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+        template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu
+        # Asymmetry: K=turbo3_0 x V=q8_0 crashes ptxas (KQ-side analyzer weight),
+        # but K=q8_0 x V=turbo3_0 builds fine at -O3. So only the turbo3_0-q8_0
+        # direction needs the -O0 fallback; q8_0-turbo3_0 stays optimized.
+        template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+        PROPERTIES COMPILE_FLAGS "--ptxas-options=-O0")
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}

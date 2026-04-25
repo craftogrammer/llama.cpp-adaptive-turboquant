@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES
+#include <math.h>
 /*
  * TurboQuant: KV cache compression via PolarQuant + QJL
  * Based on: arXiv 2504.19874 (ICLR 2026)
@@ -6,6 +8,7 @@
  * GGML_TYPE_TURBO4_0 (4-bit) for use as --cache-type-k turboN in llama-server.
  */
 
+#include "ggml.h"
 #include "ggml-quants.h"
 #include "ggml-common.h"
 #include "ggml-impl.h"
@@ -16,7 +19,7 @@
 #include <stdlib.h>
 
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-int turbo3_cpu_wht_group_size = 0;
+GGML_API int turbo3_cpu_wht_group_size = 0;
 
 /* ---------- constants ---------- */
 

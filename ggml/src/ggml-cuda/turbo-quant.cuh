@@ -2,7 +2,7 @@
  * TurboQuant CUDA kernels for KV cache compression
  * Based on: arXiv 2504.19874 (ICLR 2026)
  *
- * Implements GGML_TYPE_TURBO3_0 (3-bit PolarQuant, block size 32)
+ * Implements GGML_TYPE_TURBO3_0 (3-bit PolarQuant, block size 128)
  * Constants, WHT rotation, quantize/dequantize device functions.
  */
 
@@ -315,7 +315,7 @@ static __device__ __forceinline__ uint8_t turbo_nearest_centroid_3bit(float val)
     else                              return 7;
 }
 
-// ---- Per-block quantize (32 elements, expects already-rotated input) ----
+// ---- Per-block quantize (QK_TURBO3 elements, expects already-rotated input) ----
 // Used by set_rows after group-level WHT rotation
 
 static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ src,
