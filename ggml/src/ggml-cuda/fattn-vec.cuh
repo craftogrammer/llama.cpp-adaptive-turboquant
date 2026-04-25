@@ -1,7 +1,5 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
-#include <cerrno>
-#include <cstdlib>
 
 // Per-TU sink state — in fattn-vec.cuh so kernel and host code share the same TU copy.
 // Only K sinks are used in the VEC kernel. V sinks were removed from the V accumulation
@@ -11,48 +9,6 @@
 static __device__ const half * d_fattn_sink_K_buf = nullptr;
 static __device__ int          d_fattn_sink_n     = 0;
 static __device__ int64_t      d_fattn_sink_ne0   = 0;
-
-// Sparse-V threshold: env-controllable via TURBO_SPARSE_V_THRESHOLD (float).
-// Default 1e-6f matches TheTom/turboquant_plus's validated baseline (CI ±0.021,
-// 50 chunks wikitext-103). Madreag README's "5e-3 / 1e-2 type-adaptive" line is
-// undocumented divergence — code follows upstream-validated 1e-6 by default.
-// Sweep upward (1e-3 / 5e-3 / 1e-2) via env var to bench potential decode wins
-// at long context; pair with the user's 12-test grader to confirm zero PPL cost.
-//
-// Stored as __constant__ memory (broadcast-cached, immediate-operand-friendly to
-// the ptxas analyzer on sm_120) with the half value precomputed host-side, NOT
-// __float2half'd in the kernel — runtime __float2half at kernel entry expands
-// to denorm-handling ops live across the kernel body, blowing up register
-// liveness tracking and tipping ptxas into ACCESS_VIOLATION on q8_0-q8_0 at -O3.
-static __constant__ float d_sparse_v_threshold_f;
-static __constant__ half  d_sparse_v_threshold_h;
-
-// Free function (non-template) that parses the env var and uploads BOTH symbols
-// (default + override path) on first call. Always uploads so first-kernel
-// correctness doesn't depend on the env var being set. Called from the
-// dispatcher in fattn.cu, kept out of the templated path to avoid analyzer bloat.
-static inline void turbo_sparse_v_threshold_init() {
-    static bool inited = false;
-    if (inited) return;
-    inited = true;
-
-    float thr_f = 1e-6f;  // upstream-validated default
-    const char * s = getenv("TURBO_SPARSE_V_THRESHOLD");
-    if (s) {
-        char * end; errno = 0;
-        float t = strtof(s, &end);
-        if (end != s && errno == 0 && t > 0.0f && t < 1.0f) {
-            thr_f = t;
-            int device; cudaGetDevice(&device);
-            fprintf(stderr, "TURBO: sparse-V threshold=%g (device %d, default 1e-6)\n", thr_f, device);
-        } else {
-            fprintf(stderr, "TURBO: invalid TURBO_SPARSE_V_THRESHOLD='%s' (expected (0, 1)); using default 1e-6\n", s);
-        }
-    }
-    const __half thr_h = __float2half(thr_f);
-    CUDA_CHECK(cudaMemcpyToSymbol(d_sparse_v_threshold_f, &thr_f, sizeof(float)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_sparse_v_threshold_h, &thr_h, sizeof(__half)));
-}
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -214,13 +170,10 @@ static __global__ void flash_attn_ext_vec(
     }
 
     // Sparse V: skip V dequant for positions with negligible attention weights.
-    // Both threshold values come from __constant__ symbols populated host-side
-    // by turbo_sparse_v_threshold_init() (TURBO_SPARSE_V_THRESHOLD env var,
-    // default 1e-6 = upstream-validated baseline). The half value is precomputed
-    // host-side to avoid kernel-entry __float2half pressuring the ptxas analyzer.
-    const float sparse_v_threshold_f = d_sparse_v_threshold_f;
+    // Keep the validated conservative threshold to avoid quality regressions.
+    constexpr float sparse_v_threshold_f = 1e-6f;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    const half  sparse_v_threshold_h = d_sparse_v_threshold_h;
+    const     half  sparse_v_threshold_h = __float2half(sparse_v_threshold_f);
 #endif
 
     float KQ_max[ncols];
