@@ -124,8 +124,39 @@ llama_kv_cache::llama_kv_cache(
     // For layer-adaptive modes: use KV layer ordinals (not raw layer indices)
     // so boundary targeting works correctly on hybrid architectures where only
     // a subset of layers have KV caches (e.g., Qwen3.5-27B: 16 of 64 layers).
-    const uint32_t n_kv_layers = hparams.n_layer_kv();
+    uint32_t n_kv_layers = 0;
+    for (uint32_t il = 0; il < hparams.n_layer; il++) {
+        if (!hparams.has_kv(il)) {
+            continue;
+        }
+        if (filter && !filter(il)) {
+            continue;
+        }
+        n_kv_layers++;
+    }
     uint32_t kv_ord = 0;
+
+    const int adaptive_mode = [&]() {
+        const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+        if (env) {
+            const int mode = atoi(env);
+            if (mode > 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env, using KV ordinals)\n", mode);
+            } else {
+                LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive disabled by TURBO_LAYER_ADAPTIVE=0\n");
+            }
+            return mode;
+        }
+        if (type_v == GGML_TYPE_TURBO3_TCQ && hparams.n_layer >= 8) {
+            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo3_tcq-V (mode 13, opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+            return 13;
+        }
+        if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer >= 8) {
+            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (mode 12, opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+            return 12;
+        }
+        return 0;
+    }();
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -198,22 +229,6 @@ llama_kv_cache::llama_kv_cache(
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            static const int adaptive_mode = [&]() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env, using KV ordinals)\n", mode);
-                    }
-                    return mode;
-                }
-                // Auto-enable Boundary V (mode 12) when V is turbo2 and model has enough layers
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (mode 12, opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 12;
-                }
-                return 0;
-            }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
                                    type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO1_5 ||
                                    type_k == GGML_TYPE_TURBO3_TCQ || type_k == GGML_TYPE_TURBO2_TCQ ||
@@ -351,11 +366,31 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+        int n_k_q8_0 = 0;
+        int n_v_q8_0 = 0;
+        int n_k_turbo3_tcq = 0;
+        int n_v_turbo3_tcq = 0;
+        for (const auto & layer : layers) {
+            if (layer.k && layer.k->type == GGML_TYPE_Q8_0) {
+                n_k_q8_0++;
+            }
+            if (layer.v && layer.v->type == GGML_TYPE_Q8_0) {
+                n_v_q8_0++;
+            }
+            if (layer.k && layer.k->type == GGML_TYPE_TURBO3_TCQ) {
+                n_k_turbo3_tcq++;
+            }
+            if (layer.v && layer.v->type == GGML_TYPE_TURBO3_TCQ) {
+                n_v_turbo3_tcq++;
+            }
+        }
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        LLAMA_LOG_INFO("%s: actual KV layer types: K q8_0=%d turbo3_tcq=%d, V q8_0=%d turbo3_tcq=%d\n", __func__,
+                n_k_q8_0, n_k_turbo3_tcq, n_v_q8_0, n_v_turbo3_tcq);
     }
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");

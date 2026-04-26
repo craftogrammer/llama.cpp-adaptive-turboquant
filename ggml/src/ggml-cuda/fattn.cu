@@ -211,6 +211,30 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         }                                                                                                        \
     }                                                                                                            \
 
+#define FATTN_VEC_CASE_NO_SOFTCAP(D, type_K, type_V)                                                             \
+    {                                                                                                            \
+        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
+        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
+            ggml_cuda_flash_attn_ext_vec_case_no_softcap<D, type_K, type_V>(ctx, dst);                           \
+            return;                                                                                              \
+        }                                                                                                        \
+    }                                                                                                            \
+
+#define FATTN_VEC_CASE_DECODE_NO_SOFTCAP(D, type_K, type_V)                                                      \
+    {                                                                                                            \
+        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
+        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
+            if (Q->ne[1] == 1) {                                                                                 \
+                ggml_cuda_flash_attn_ext_vec_case_decode_no_softcap<D, type_K, type_V>(ctx, dst);                \
+                return;                                                                                          \
+            }                                                                                                    \
+            ggml_cuda_flash_attn_ext_vec_case_prefill_no_softcap<D, type_K, type_V>(ctx, dst);                   \
+            return;                                                                                              \
+        }                                                                                                        \
+    }                                                                                                            \
+
 #define FATTN_VEC_CASES_ALL_D(type_K, type_V) \
     FATTN_VEC_CASE( 64, type_K, type_V)       \
     FATTN_VEC_CASE(128, type_K, type_V)       \
@@ -318,10 +342,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // TCQ x q8_0 mixed pairs: enables LAYER_ADAPTIVE alongside TCQ KV. Same D=128/256
     // limitation as TCQ symmetric. Block size mismatch (52B TCQ vs 34B q8_0) is fine
     // because K and V tensors have separate strides.
-    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)
-    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_NO_SOFTCAP(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)
 
     GGML_ABORT("fatal error");
 }
@@ -398,7 +420,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        // Allow turbo cross-type KV combinations, but never mix TCQ with non-TCQ
+        // Layer-adaptive TCQ uses q8_0 boundary V layers; keep other TCQ/non-TCQ pairs rejected.
         auto is_turbo_nontcq = [](ggml_type t) {
             return t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
                    t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO1_5;
@@ -410,9 +432,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return is_turbo_nontcq(t) || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16;
         };
         const bool tcq_cross = is_tcq(K->type) && is_tcq(V->type);
+        const bool tcq_q8_cross = (is_tcq(K->type) && V->type == GGML_TYPE_Q8_0) ||
+                                  (K->type == GGML_TYPE_Q8_0 && is_tcq(V->type));
         const bool turbo_cross = (is_turbo_nontcq(K->type) || is_turbo_nontcq(V->type)) &&
                                   is_turbo_compatible(K->type) && is_turbo_compatible(V->type);
-        if (!tcq_cross && !turbo_cross) {
+        if (!tcq_cross && !tcq_q8_cross && !turbo_cross) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }

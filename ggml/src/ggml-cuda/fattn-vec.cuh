@@ -146,7 +146,8 @@ static __global__ void flash_attn_ext_vec(
     constexpr bool K_is_tcq2 = type_K == GGML_TYPE_TURBO2_TCQ;
     constexpr bool V_is_tcq3 = type_V == GGML_TYPE_TURBO3_TCQ;
     constexpr bool V_is_tcq2 = type_V == GGML_TYPE_TURBO2_TCQ;
-    constexpr int smem_cb_K_size = K_is_tcq3 ? 512 : (K_is_tcq2 ? 256 : 0);
+    constexpr bool K_tcq_uses_smem_cb = (K_is_tcq3 || K_is_tcq2) && type_V != GGML_TYPE_Q8_0;
+    constexpr int smem_cb_K_size = K_tcq_uses_smem_cb ? (K_is_tcq3 ? 512 : 256) : 0;
     constexpr int smem_cb_V_size = V_is_tcq3 ? 512 : (V_is_tcq2 ? 256 : 0);
     constexpr bool share_cb = (K_is_tcq3 && V_is_tcq3) || (K_is_tcq2 && V_is_tcq2);
     constexpr int smem_cb_total = share_cb ? smem_cb_K_size : (smem_cb_K_size + smem_cb_V_size);
@@ -436,8 +437,13 @@ static __global__ void flash_attn_ext_vec(
                         const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
                         sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
                     } else {
-                        sum = vec_dot_fattn_vec_KQ_turbo3_tcq_cb<D, nthreads_KQ>(
-                            K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                        if constexpr (type_V == GGML_TYPE_Q8_0) {
+                            sum = vec_dot_fattn_vec_KQ_turbo3_tcq_decode<D, nthreads_KQ>(
+                                K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        } else {
+                            sum = vec_dot_fattn_vec_KQ_turbo3_tcq_cb<D, nthreads_KQ>(
+                                K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                        }
                     }
                 } else if constexpr (type_K == GGML_TYPE_TURBO2_TCQ) {
                     const int kv_pos = k_VKQ_0 + i_KQ;
@@ -446,8 +452,13 @@ static __global__ void flash_attn_ext_vec(
                         const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
                         sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
                     } else {
-                        sum = vec_dot_fattn_vec_KQ_turbo2_tcq_cb<D, nthreads_KQ>(
-                            K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                        if constexpr (type_V == GGML_TYPE_Q8_0) {
+                            sum = vec_dot_fattn_vec_KQ_turbo2_tcq<D, nthreads_KQ>(
+                                K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        } else {
+                            sum = vec_dot_fattn_vec_KQ_turbo2_tcq_cb<D, nthreads_KQ>(
+                                K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook_K);
+                        }
                     }
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
@@ -829,8 +840,71 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     }
 }
 
+template <int D, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_vec_case_no_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV = dst;
+    const ggml_tensor * Q   = dst->src[0];
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    GGML_ASSERT(logit_softcap == 0.0f);
+
+    if (Q->ne[1] == 1) {
+        constexpr int cols_per_block = 1;
+        constexpr bool use_logit_softcap = false;
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        return;
+    }
+
+    constexpr int cols_per_block = 2;
+    constexpr bool use_logit_softcap = false;
+    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+}
+
+template <int D, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_vec_case_decode_no_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV = dst;
+    const ggml_tensor * Q   = dst->src[0];
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    GGML_ASSERT(logit_softcap == 0.0f);
+    GGML_ASSERT(Q->ne[1] == 1);
+
+    constexpr int cols_per_block = 1;
+    constexpr bool use_logit_softcap = false;
+    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+}
+
+template <int D, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_vec_case_prefill_no_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV = dst;
+    const ggml_tensor * Q   = dst->src[0];
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    GGML_ASSERT(logit_softcap == 0.0f);
+    GGML_ASSERT(Q->ne[1] != 1);
+
+    constexpr int cols_per_block = 2;
+    constexpr bool use_logit_softcap = false;
+    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+}
+
 #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \
     template void ggml_cuda_flash_attn_ext_vec_case                         \
+    <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+#define DECL_FATTN_VEC_CASE_NO_SOFTCAP(D, type_K, type_V)                   \
+    template void ggml_cuda_flash_attn_ext_vec_case_no_softcap              \
+    <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+#define DECL_FATTN_VEC_CASE_DECODE_NO_SOFTCAP(D, type_K, type_V)            \
+    template void ggml_cuda_flash_attn_ext_vec_case_decode_no_softcap       \
+    <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+#define DECL_FATTN_VEC_CASE_PREFILL_NO_SOFTCAP(D, type_K, type_V)           \
+    template void ggml_cuda_flash_attn_ext_vec_case_prefill_no_softcap      \
     <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
 #define EXTERN_DECL_FATTN_VEC_CASES(D, type_K)             \
@@ -918,6 +992,16 @@ EXTERN_DECL_FATTN_VEC_TURBO(GGML_TYPE_F16, GGML_TYPE_TURBO1_5)
     extern DECL_FATTN_VEC_CASE(128, type_K, type_V); \
     extern DECL_FATTN_VEC_CASE(256, type_K, type_V);
 
+#define EXTERN_DECL_FATTN_VEC_TCQ_NO_SOFTCAP(type_K, type_V) \
+    extern DECL_FATTN_VEC_CASE_NO_SOFTCAP(128, type_K, type_V); \
+    extern DECL_FATTN_VEC_CASE_NO_SOFTCAP(256, type_K, type_V);
+
+#define EXTERN_DECL_FATTN_VEC_TCQ_DECODE_NO_SOFTCAP(type_K, type_V) \
+    extern DECL_FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, type_K, type_V);
+
+#define EXTERN_DECL_FATTN_VEC_TCQ_PREFILL_NO_SOFTCAP(type_K, type_V) \
+    extern DECL_FATTN_VEC_CASE_PREFILL_NO_SOFTCAP(256, type_K, type_V);
+
 // Symmetric TCQ types
 EXTERN_DECL_FATTN_VEC_TCQ(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 EXTERN_DECL_FATTN_VEC_TCQ(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
@@ -925,3 +1009,8 @@ EXTERN_DECL_FATTN_VEC_TCQ(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
 // TCQ cross-types (turbo3_tcq x turbo2_tcq)
 EXTERN_DECL_FATTN_VEC_TCQ(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ)
 EXTERN_DECL_FATTN_VEC_TCQ(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO3_TCQ)
+
+// TCQ x q8_0 cross-types used by layer-adaptive TCQ.
+EXTERN_DECL_FATTN_VEC_TCQ_DECODE_NO_SOFTCAP(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+EXTERN_DECL_FATTN_VEC_TCQ_PREFILL_NO_SOFTCAP(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+EXTERN_DECL_FATTN_VEC_TCQ_NO_SOFTCAP(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)

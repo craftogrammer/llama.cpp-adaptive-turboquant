@@ -135,6 +135,7 @@ if (CUDAToolkit_FOUND)
             # Gemma 4 garbage output (spiritbuun issue #12) is head_dim=512 specific
             # (FWHT-128 mismatch); doesn't apply to Qwen3.6's head_dim=256.
             template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu
+            template-instances/fattn-vec-instance-turbo3_tcq-q8_0-prefill.cu
             template-instances/fattn-vec-instance-q8_0-turbo3_tcq.cu
             # turbo2_0: 2-bit scalar quant, ~7.53x compression. Per fork README, fastest
             # at every depth on every tested GPU. Boundary V auto-activates (mode 12) for
@@ -179,17 +180,6 @@ if (CUDAToolkit_FOUND)
         # turbo2_0: preemptive -O0 — body is similar weight to turbo3_0 (4 centroid
         # lookups, bit-shift decode), so ptxas analyzer is likely to crash at -O3.
         template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
-        # TCQ x q8_0 mixed pairs: must stay at -O0. Per session 2026-04-25 we walked
-        # the full ptxas ladder on `turbo3_tcq-q8_0.cu` — at -O3, --allow-expensive-
-        # optimizations=false, -O1, and -O2 ptxas crashes with ACCESS_VIOLATION on
-        # sm_120; only -O0 produces a buildable .obj. At -O0 this TU's runtime SASS
-        # is incorrect (silent server exit on boundary layer dispatch when
-        # LAYER_ADAPTIVE=13 + TCQ KV is enabled). Real fix requires SASS-diff
-        # diagnosis vs the working `turbo3_0-q8_0` pair, not a flag swap. Until
-        # that work happens, do not enable LAYER_ADAPTIVE=13 with `-ctk turbo3_tcq
-        # -ctv turbo3_tcq` — uniform TCQ (no LA) is fine and ships.
-        template-instances/fattn-vec-instance-turbo3_tcq-q8_0.cu
-        template-instances/fattn-vec-instance-q8_0-turbo3_tcq.cu
         # turbo2_0 x q8_0 mixed pairs: preemptive -O0 — turbo2_0 K-side analyzer
         # weight matches turbo2_0-turbo2_0 (which is already -O0). The q8_0-turbo2_0
         # direction may be safe at -O3 (q8_0 K path is light, turbo3_0-q8_0's reverse
