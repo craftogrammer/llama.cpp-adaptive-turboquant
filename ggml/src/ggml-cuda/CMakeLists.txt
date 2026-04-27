@@ -123,14 +123,29 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
             # Turbo3 symmetric (primary target for --cache-type-k turbo3 --cache-type-v turbo3)
-            template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d64-decode.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d64-prefill.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d128-decode.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d128-prefill.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d256-decode.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d256-prefill.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d512-decode.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0-d512-prefill.cu
             # Mixed turbo3_0 x q8_0: required for TURBO_LAYER_ADAPTIVE modes that
             # promote per-layer V (or K) to q8_0 while keeping the other side at turbo3.
-            template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0-d64-decode.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0-d64-prefill.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0-d128-decode.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0-d128-prefill.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0-d256-decode.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0-d256-prefill.cu
             template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
             # TCQ variant: trellis-coded 3-bit, 3.25 bpv (+4% vs turbo3_0), potentially
             # better quality at similar size. Enables --cache-type-k/v turbo3_tcq.
-            template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu
+            template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq-d128-decode.cu
+            template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq-d128-prefill.cu
+            template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq-d256-decode.cu
+            template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq-d256-prefill.cu
             # TCQ x q8_0 mixed pairs: enables LAYER_ADAPTIVE modes alongside TCQ KV.
             # Gemma 4 garbage output (spiritbuun issue #12) is head_dim=512 specific
             # (FWHT-128 mismatch); doesn't apply to Qwen3.6's head_dim=256.
@@ -140,13 +155,25 @@ if (CUDAToolkit_FOUND)
             # turbo2_0: 2-bit scalar quant, ~7.53x compression. Per fork README, fastest
             # at every depth on every tested GPU. Boundary V auto-activates (mode 12) for
             # turbo2-V via llama-kv-cache.cpp. Worth trying for higher-context workloads.
-            template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d64-decode.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d64-prefill.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d128-decode.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d128-prefill.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d256-decode.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d256-prefill.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d512-decode.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0-d512-prefill.cu
             # turbo2_0 x q8_0 mixed pairs: required for auto-mode-12 to actually fire
             # without aborting. Without these instances, llama-kv-cache.cpp:212's
             # boundary-V-to-q8_0 promotion crashes when dispatched. With them, V on
             # first/last attention layers gets the wider q8_0 representation, while
             # interior V layers stay at 2-bit turbo2.
-            template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0-d64-decode.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0-d64-prefill.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0-d128-decode.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0-d128-prefill.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0-d256-decode.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0-d256-prefill.cu
             template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
             # EXCLUDED: bf16 template instances cause ptxas ACCESS_VIOLATION on SM120 with CUDA 12.8.2.
             # turbo4_0 also excluded — known NaN regression on Qwen3.5-9B (issue #60),
@@ -158,35 +185,9 @@ if (CUDAToolkit_FOUND)
         )
     endif()
 
-    # Windows ptxas ACCESS_VIOLATION workaround (SM120 / CUDA 12.9):
-    # - q4_0 K/V helpers in fattn-common.cuh are marked __noinline__. That alone
-    #   lets this file build cleanly at full -O3.
-    # - turbo3_0 + turbo3_tcq TUs fall back to -O0 (heavy dequant bodies that
-    #   ptxas's analyzer chokes on even with __noinline__ on helpers).
-    # - Benchmarked: at -O0 on turbo3_0 TU we get ~36 t/s decode on Qwen3.6-27B
-    #   at 140k context — matches original baseline, so no further tuning needed.
-    set_source_files_properties(
-        # fattn.cu itself is the vec FA dispatch table. With many template specializations
-        # (turbo3, turbo2, TCQ, mixed pairs) the analyzer footprint exceeds Windows ptxas
-        # capacity at -O3 -> ACCESS_VIOLATION. -O0 here is essentially free at runtime
-        # (this TU is only routing logic, not the kernel hot path).
-        fattn.cu
-        template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-        template-instances/fattn-vec-instance-turbo3_tcq-turbo3_tcq.cu
-        # Asymmetry: K=turbo3_0 x V=q8_0 crashes ptxas (KQ-side analyzer weight),
-        # but K=q8_0 x V=turbo3_0 builds fine at -O3. So only the turbo3_0-q8_0
-        # direction needs the -O0 fallback; q8_0-turbo3_0 stays optimized.
-        template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
-        # turbo2_0: preemptive -O0 — body is similar weight to turbo3_0 (4 centroid
-        # lookups, bit-shift decode), so ptxas analyzer is likely to crash at -O3.
-        template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
-        # turbo2_0 x q8_0 mixed pairs: preemptive -O0 — turbo2_0 K-side analyzer
-        # weight matches turbo2_0-turbo2_0 (which is already -O0). The q8_0-turbo2_0
-        # direction may be safe at -O3 (q8_0 K path is light, turbo3_0-q8_0's reverse
-        # builds fine without it); include it preemptively, can drop if clean.
-        template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
-        template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
-        PROPERTIES COMPILE_FLAGS "--ptxas-options=-O0")
+    # SM120 ptxas workarounds should live in source structure, not per-TU -O0.
+    # Keep this list empty unless a TU still crashes after isolating the smallest
+    # failing construct and there is no source-level containment left.
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}

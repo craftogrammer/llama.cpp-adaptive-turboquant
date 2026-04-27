@@ -1,0 +1,3 @@
+#include "../fattn-vec.cuh"
+
+DECL_FATTN_VEC_CASE_DECODE_NO_SOFTCAP(64, GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0);

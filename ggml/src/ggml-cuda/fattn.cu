@@ -246,6 +246,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(256, type_K, type_V)              \
     FATTN_VEC_CASE(512, type_K, type_V)              \
 
+#define FATTN_VEC_CASES_ALL_D_TURBO_NO_SOFTCAP(type_K, type_V) \
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP( 64, type_K, type_V)       \
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(128, type_K, type_V)       \
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, type_K, type_V)       \
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(512, type_K, type_V)       \
+
+#define FATTN_VEC_CASES_ALL_D_NO_SOFTCAP(type_K, type_V) \
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP( 64, type_K, type_V) \
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(128, type_K, type_V) \
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, type_K, type_V) \
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -315,29 +326,29 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     // Turbo3 symmetric (primary target for --cache-type-k turbo3 --cache-type-v turbo3)
-    FATTN_VEC_CASES_ALL_D_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D_TURBO_NO_SOFTCAP(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
 
     // Turbo2 symmetric (--cache-type-k turbo2 --cache-type-v turbo2). Per fork README,
     // fastest decode at every depth on every tested GPU. Boundary V auto-activates
     // (LAYER_ADAPTIVE mode 12) when V is turbo2 in llama-kv-cache.cpp.
-    FATTN_VEC_CASES_ALL_D_TURBO(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D_TURBO_NO_SOFTCAP(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
 
     // Mixed turbo3_0 x q8_0: required by TURBO_LAYER_ADAPTIVE modes that promote
     // per-layer V (or K) to q8_0 while keeping the other side at turbo3.
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D_NO_SOFTCAP(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0)
 
     // Mixed turbo2_0 x q8_0: unlocks auto-mode-12 (boundary V promotion to q8_0
     // on first/last attention layers) for the turbo2 SHIP config. Without this
     // pair, llama-kv-cache.cpp:212's auto-enable would dispatch into a missing
     // template instance and abort.
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D_NO_SOFTCAP(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0)
 
     // Turbo3 TCQ symmetric (--cache-type-k turbo3_tcq --cache-type-v turbo3_tcq).
     // TCQ template instance only covers D=128 and D=256, not 64/512.
-    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
-    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
 
     // TCQ x q8_0 mixed pairs: enables LAYER_ADAPTIVE alongside TCQ KV. Same D=128/256
     // limitation as TCQ symmetric. Block size mismatch (52B TCQ vs 34B q8_0) is fine

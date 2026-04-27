@@ -357,6 +357,53 @@ static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     return sum;
 }
 
+// Lean turbo3 KQ path for sm_120 ptxas: same arithmetic as the standard helper,
+// but the loop is deliberately not unrolled so each FA instantiation stays small.
+template <int D, int nthreads>
+static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo3_0_lean(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo3_0 * K_turbo = (const block_turbo3_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    const float2 * Q_ds = (const float2 *) Q_ds_v;
+    float sum = 0.0f;
+
+#pragma unroll 1
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int elem0 = k_KQ * 4;
+        const int ib    = elem0 / QK_TURBO3;
+        const int j0    = elem0 % QK_TURBO3;
+
+        const float   norm     = __half2float(K_turbo[ib].norm);
+        const uint8_t qs_byte  = K_turbo[ib].qs[j0 / 4];
+        const uint8_t sgn_byte = K_turbo[ib].signs[j0 / 8];
+        const int     sgn_shift = j0 % 8;
+
+        const uint8_t idx0 = ((qs_byte >> 0) & 0x3) | (((sgn_byte >> (sgn_shift + 0)) & 0x1) << 2);
+        const uint8_t idx1 = ((qs_byte >> 2) & 0x3) | (((sgn_byte >> (sgn_shift + 1)) & 0x1) << 2);
+        const uint8_t idx2 = ((qs_byte >> 4) & 0x3) | (((sgn_byte >> (sgn_shift + 2)) & 0x1) << 2);
+        const uint8_t idx3 = ((qs_byte >> 6) & 0x3) | (((sgn_byte >> (sgn_shift + 3)) & 0x1) << 2);
+
+        const float k0 = TURBO_CENTROIDS_3BIT[idx0] * norm;
+        const float k1 = TURBO_CENTROIDS_3BIT[idx1] * norm;
+        const float k2 = TURBO_CENTROIDS_3BIT[idx2] * norm;
+        const float k3 = TURBO_CENTROIDS_3BIT[idx3] * norm;
+
+        const int   q_word = Q_q8[k_KQ_0/nthreads];
+        const float Q_d    = Q_ds[k_KQ_0/nthreads].x;
+
+        sum += (k0 * float((int8_t)((q_word >>  0) & 0xFF)) +
+                k1 * float((int8_t)((q_word >>  8) & 0xFF)) +
+                k2 * float((int8_t)((q_word >> 16) & 0xFF)) +
+                k3 * float((int8_t)((q_word >> 24) & 0xFF))) * Q_d;
+    }
+
+    return sum;
+}
+
 // Turbo2 KQ dot product: dequantize K from turbo2 blocks, dot with q8_1 Q.
 // Same structure as turbo3 but reads 2-bit indices from qs only (no signs).
 // __noinline__: same Windows ptxas SM120 workaround as the turbo3 helpers.
