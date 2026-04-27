@@ -1131,8 +1131,71 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq(
 // body trips Windows ptxas on sm_120 when compiled inside the mixed-pair FA TU.
 // Keep the same per-lane element mapping as the generic scorer while presenting
 // ptxas with a single non-unrolled pair loop.
+//
+// Two siblings, identical bodies, different inline policies — selected per-TU
+// in fattn-vec.cuh based on type_V:
+//   * `vec_dot_fattn_vec_KQ_turbo3_tcq_decode` (this one) — `__noinline__`,
+//     used by the mixed-pair (turbo3_tcq × q8_0) FA TU where forcing the body
+//     into the FA kernel re-triggers the ptxas access violation.
+//   * `vec_dot_fattn_vec_KQ_turbo3_tcq_decode_inline` (below) — `__forceinline__`,
+//     used by the same-type (turbo3_tcq × turbo3_tcq) TU where empirically
+//     ptxas tolerates the inlined body. This saves the per-K-position
+//     function-call overhead, which is the dominant cost at long context
+//     (~4M calls/token at 64K KV across 16 attn × 4 KV heads).
 template<int D, int nthreads>
 static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_decode(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_turbo3_tcq * K_tcq = (const block_turbo3_tcq *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    constexpr int npairs_per_thread = (D/2) / nthreads;
+    const int lane = threadIdx.x % nthreads;
+
+    float sum = 0.0f;
+    int prev_ib = -1;
+    float norm = 0.0f;
+
+#pragma unroll 1
+    for (int qi = 0; qi < npairs_per_thread; ++qi) {
+        const int group = qi / cpy_ne;
+        const int in_group = qi - group * cpy_ne;
+        const int pair = group * (nthreads * cpy_ne) + lane * cpy_ne + in_group;
+        const int t0 = pair * 2;
+        const int ib = t0 / QK_TURBO3_TCQ;
+
+        if (ib != prev_ib) {
+            norm = __half2float(K_tcq[ib].norm);
+            prev_ib = ib;
+        }
+
+        const int j0 = t0 - ib * QK_TURBO3_TCQ;
+        const int bp0 = j0 * 3;
+        const uint32_t raw0 = (uint32_t)K_tcq[ib].qs[bp0 >> 3] | ((uint32_t)K_tcq[ib].qs[(bp0 >> 3) + 1] << 8);
+        const float k0 = d_turbo3_tcq_codebook[(raw0 >> (bp0 & 7)) & 0x1FF] * norm;
+
+        const int bp1 = bp0 + 3;
+        const uint32_t raw1 = (uint32_t)K_tcq[ib].qs[bp1 >> 3] | ((uint32_t)K_tcq[ib].qs[(bp1 >> 3) + 1] << 8);
+        const float k1 = d_turbo3_tcq_codebook[(raw1 >> (bp1 & 7)) & 0x1FF] * norm;
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const float2 qf = __half22float2(((const half2 *) Q_v)[qi]);
+#else
+        const float2 qf = ((const float2 *) Q_v)[qi];
+#endif
+        sum += k0 * qf.x + k1 * qf.y;
+    }
+
+    return sum;
+}
+
+// Same body, force-inlined. ONLY safe to call from same-type FA TU
+// (turbo3_tcq × turbo3_tcq); mixed-pair callers (e.g. V=q8_0) MUST use the
+// __noinline__ variant above to dodge the ptxas crash.
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_decode_inline(
     const char * __restrict__ K_c, const void * __restrict__ Q_v,
     const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
     const block_turbo3_tcq * K_tcq = (const block_turbo3_tcq *) K_c;

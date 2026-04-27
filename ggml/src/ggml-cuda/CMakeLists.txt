@@ -183,6 +183,14 @@ if (CUDAToolkit_FOUND)
             # - fattn-vec-instance-bf16-*.cu (all 7 files)
             # - fattn-vec-instance-*-bf16.cu (all 6 files)
         )
+
+        if (GGML_CUDA_TURBO_QWEN_D256_ONLY)
+            message(STATUS "Using Qwen D=256-only TurboQuant FA vec instances")
+            add_compile_definitions(GGML_CUDA_TURBO_QWEN_D256_ONLY)
+            list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "template-instances/fattn-vec-instance-turbo(2_0|3_0|3_tcq)-.*-d(64|128|512)-")
+            list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "template-instances/fattn-vec-instance-turbo(2_0|3_0)-q8_0-d(64|128|512)-")
+            list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "template-instances/fattn-vec-instance-q8_0-turbo(2_0|3_0|3_tcq)\\.cu$")
+        endif()
     endif()
 
     # SM120 ptxas workarounds should live in source structure, not per-TU -O0.

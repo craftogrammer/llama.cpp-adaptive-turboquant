@@ -34,8 +34,16 @@ static constexpr __host__ __device__ vec_dot_KQ_t get_vec_dot_KQ_fattn() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 3) // 3 blocks/SM = 12 warps = 25% occupancy on SM120
+// `min_blocks_per_sm` is a template parameter so the dispatcher in
+// ggml_cuda_flash_attn_ext_vec_case_impl can raise occupancy on (type_K, type_V)
+// pairs that ptxas tolerates, without globally bumping minBlocks (which on
+// Windows + nvcc 12.9 + sm_120 trips ACCESS_VIOLATION in fattn-vec-instance-
+// f16-f16 and -q8_0-q8_0). The (turbo3_tcq, turbo3_tcq) same-type instance
+// compiles cleanly at 4 and the higher occupancy gives noticeable long-context
+// gains where the kernel is memory-latency bound. Default of 3 preserves
+// behaviour for every other (type_K, type_V) instantiation.
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int min_blocks_per_sm = 3>
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), min_blocks_per_sm)
 static __global__ void flash_attn_ext_vec(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -362,6 +370,13 @@ static __global__ void flash_attn_ext_vec(
                         const int kv_head = head / gqa_ratio;
                         const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
                         sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
+                        // Same-type TU: ptxas tolerates inlining the lean (unroll-1)
+                        // body here, so call the __forceinline__ sibling and skip
+                        // the per-K-position function-call overhead. Mixed-pair TUs
+                        // (V=q8_0) fall through to the __noinline__ variant below.
+                        sum = vec_dot_fattn_vec_KQ_turbo3_tcq_decode_inline<D, nthreads_KQ>(
+                            K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                     } else {
                         sum = vec_dot_fattn_vec_KQ_turbo3_tcq_decode<D, nthreads_KQ>(
                             K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
@@ -726,7 +741,24 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    // Raise FA-vec occupancy to ~33% on sm_120 for the same-type turbo3_tcq path
+    // (vs 25% at the default minBlocks=3), giving the SM more in-flight warps
+    // for the memory-latency-bound TCQ codebook lookups that dominate decode at
+    // long context. Trade-off measured on Qwen3.6-27B IQ3 / RTX 5080:
+    //   d=4K  : -2.3% TG (register pressure costs more than the extra warps help)
+    //   d=16K : -2.9% TG
+    //   d=32K : flat
+    //   d=64K : +2.5% TG
+    // Kept because user's workload includes 128K-context use-cases where the
+    // long-context win compounds (and where decode is otherwise dropping to
+    // ~11 t/s). All other (type_K, type_V) pairs keep minBlocks=3 because
+    // f16-f16 / q8_0-q8_0 ptxas crashes at 4 on Windows + nvcc 12.9 + sm_120.
+    fattn_kernel_t fattn_kernel;
+    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ && type_V == GGML_TYPE_TURBO3_TCQ) {
+        fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, 4>;
+    } else {
+        fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, 3>;
+    }
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;

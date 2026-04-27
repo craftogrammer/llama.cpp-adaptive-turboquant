@@ -325,6 +325,16 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // BF16 vec FA templates are not instantiated in this SM120 TurboQuant build.
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+#ifdef GGML_CUDA_TURBO_QWEN_D256_ONLY
+    // Qwen3.6 uses D=256 K/V heads. In this build we deliberately omit unused
+    // TurboQuant vec FA dimensions to keep sm_120 ptxas away from dead variants.
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+#else
     // Turbo3 symmetric (primary target for --cache-type-k turbo3 --cache-type-v turbo3)
     FATTN_VEC_CASES_ALL_D_TURBO_NO_SOFTCAP(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
 
@@ -355,6 +365,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // because K and V tensors have separate strides.
     FATTN_VEC_CASE_DECODE_NO_SOFTCAP(256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
     FATTN_VEC_CASE_NO_SOFTCAP(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)
+#endif
 
     GGML_ABORT("fatal error");
 }
