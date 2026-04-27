@@ -1194,6 +1194,17 @@ static __device__ __noinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_decode(
 // Same body, force-inlined. ONLY safe to call from same-type FA TU
 // (turbo3_tcq × turbo3_tcq); mixed-pair callers (e.g. V=q8_0) MUST use the
 // __noinline__ variant above to dodge the ptxas crash.
+//
+// Vectorized read variant: instead of two separate 2-byte loads for raw0 and
+// raw1 (= 4 byte-load instructions in SASS), do one 4-byte load and extract
+// both 9-bit states by shifting. raw0 spans bits [bp0, bp0+9) and raw1 spans
+// bits [bp1, bp1+9) = [bp0+3, bp0+12). Both fit in a 32-bit window starting
+// at the byte containing bp0, after right-shifting by `bit_off = bp0 & 7`
+// for raw0 and `bit_off + 3` for raw1. Net: ~2× fewer global-load ops in the
+// hot inner loop. The 4-byte read can extend up to qs[50] at the last pair
+// of a block (bp0=381, byte_idx=47); this is the same OOB-into-pad pattern
+// the original 2-byte chain already exercised (it accesses qs[49]), so the
+// allocation slop the codebase relies on still covers it.
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_decode_inline(
     const char * __restrict__ K_c, const void * __restrict__ Q_v,
@@ -1225,12 +1236,15 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_decode_i
 
         const int j0 = t0 - ib * QK_TURBO3_TCQ;
         const int bp0 = j0 * 3;
-        const uint32_t raw0 = (uint32_t)K_tcq[ib].qs[bp0 >> 3] | ((uint32_t)K_tcq[ib].qs[(bp0 >> 3) + 1] << 8);
-        const float k0 = d_turbo3_tcq_codebook[(raw0 >> (bp0 & 7)) & 0x1FF] * norm;
+        const int byte_idx = bp0 >> 3;
+        const int bit_off = bp0 & 7;
 
-        const int bp1 = bp0 + 3;
-        const uint32_t raw1 = (uint32_t)K_tcq[ib].qs[bp1 >> 3] | ((uint32_t)K_tcq[ib].qs[(bp1 >> 3) + 1] << 8);
-        const float k1 = d_turbo3_tcq_codebook[(raw1 >> (bp1 & 7)) & 0x1FF] * norm;
+        // Single 4-byte load covers both raw0 (9 bits at bp0) and raw1
+        // (9 bits at bp0+3); max bits used = bit_off + 12 ≤ 19, fits in u32.
+        uint32_t raw32;
+        ggml_cuda_memcpy_1<sizeof(uint32_t), 1>(&raw32, K_tcq[ib].qs + byte_idx);
+        const float k0 = d_turbo3_tcq_codebook[(raw32 >> bit_off)       & 0x1FF] * norm;
+        const float k1 = d_turbo3_tcq_codebook[(raw32 >> (bit_off + 3)) & 0x1FF] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 qf = __half22float2(((const half2 *) Q_v)[qi]);
@@ -1362,12 +1376,26 @@ static __device__ __forceinline__ void dequantize_V_turbo3_tcq_cb_inline(
     const float norm = __half2float(x[ib].norm) * d_tcq_decode_alpha_v_fattn;
     static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
     float vals[ne];
+
+    // Consolidate the per-l byte-pair loads into a single wide load: all `ne`
+    // 9-bit states span bits [j0*3, j0*3 + 3*(ne-1) + 9) = at most 33 bits for
+    // ne=8 and at most 21 bits for ne=4. Load uint64_t for ne=8, uint32_t for
+    // ne∈{2,4}, then derive every state by a constant shift. Saves `ne-1`
+    // byte-pair loads + a bit_pos%8 / bit_pos/8 chain per iteration.
+    const int bit_pos_0 = j0 * 3;
+    const int byte_idx_0 = bit_pos_0 >> 3;
+    const int bit_off_0 = bit_pos_0 & 7;
+    uint64_t raw_bits;
+    if constexpr (ne == 8) {
+        ggml_cuda_memcpy_1<sizeof(uint64_t), 1>(&raw_bits, x[ib].qs + byte_idx_0);
+    } else {
+        uint32_t raw32;
+        ggml_cuda_memcpy_1<sizeof(uint32_t), 1>(&raw32, x[ib].qs + byte_idx_0);
+        raw_bits = raw32;
+    }
 #pragma unroll
     for (int l = 0; l < ne; l++) {
-        const int t = j0 + l;
-        const int bit_pos = t * 3;
-        const uint16_t raw = (uint16_t)x[ib].qs[bit_pos/8] | ((uint16_t)x[ib].qs[bit_pos/8 + 1] << 8);
-        const int state = (raw >> (bit_pos % 8)) & 0x1FF;
+        const int state = (int)((raw_bits >> (bit_off_0 + l * 3)) & 0x1FF);
         vals[l] = cb[state] * norm;
     }
 #ifdef FP16_AVAILABLE
