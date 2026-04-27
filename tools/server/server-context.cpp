@@ -809,6 +809,31 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
+        // TurboQuant safety guard: the thinking-anchor mechanism uses a
+        // process-global registry (g_dynamic_ranges in turbo-sink.cu) that is
+        // NOT safe under --parallel > 1. Two concurrent reasoning slots would
+        // stomp each other's anchor state. If the user opted in via
+        // TURBO_THINK_ANCHOR_ENABLE=1 while also requesting multiple parallel
+        // slots, force-disable the mechanism by setting TURBO_THINK_ANCHOR_DISABLE=1
+        // before the gate is cached on the first register_thinking_anchor() call.
+        // Matches the SRV_WRN + disable house style used for other unsupported
+        // feature combinations in this function (ctx_shift, cache_reuse, etc.).
+        {
+            const char * e_anchor_enable = std::getenv("TURBO_THINK_ANCHOR_ENABLE");
+            const bool   anchor_enable   = (e_anchor_enable && atoi(e_anchor_enable) != 0);
+            if (anchor_enable && params_base.n_parallel > 1) {
+                SRV_WRN("TURBO_THINK_ANCHOR_ENABLE=1 is incompatible with --parallel > 1 "
+                        "(n_parallel=%d); the thinking-anchor mechanism uses a process-global "
+                        "registry that is not safe across concurrent slots — force-disabling via "
+                        "TURBO_THINK_ANCHOR_DISABLE=1\n", params_base.n_parallel);
+#if defined(_WIN32)
+                _putenv_s("TURBO_THINK_ANCHOR_DISABLE", "1");
+#else
+                setenv("TURBO_THINK_ANCHOR_DISABLE", "1", 1);
+#endif
+            }
+        }
+
         // setup slots
         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
 
