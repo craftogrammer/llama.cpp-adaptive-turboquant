@@ -482,8 +482,17 @@ static __global__ void flash_attn_ext_vec(
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
-                    dequantize_V_turbo3_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);
+                    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ) {
+                        // Same-type FA TU: ptxas tolerates the inlined V dequant body
+                        // (the 2-bit V sibling is already __forceinline__ and compiles
+                        // fine, so the 3-bit workaround was inherited rather than
+                        // empirically required). Skip the per-V-element call overhead.
+                        dequantize_V_turbo3_tcq_cb_inline<half, V_rows_per_thread>(V + k*nb21, tmp,
+                            2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);
+                    } else {
+                        dequantize_V_turbo3_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
+                            2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);
+                    }
                 } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
                     dequantize_V_turbo2_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);
@@ -520,8 +529,15 @@ static __global__ void flash_attn_ext_vec(
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
-                    dequantize_V_turbo3_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);
+                    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ) {
+                        // Same-type FA TU: inline V dequant body (see half-accum
+                        // branch above for rationale).
+                        dequantize_V_turbo3_tcq_cb_inline<float, V_rows_per_thread>(V + k*nb21, tmp,
+                            2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);
+                    } else {
+                        dequantize_V_turbo3_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
+                            2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);
+                    }
                 } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
                     dequantize_V_turbo2_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, FATTN_SMEM_CODEBOOK_V);

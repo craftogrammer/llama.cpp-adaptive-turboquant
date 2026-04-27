@@ -1341,6 +1341,46 @@ static __device__ __forceinline__ void dequantize_V_turbo3_tcq(
     dequantize_V_turbo3_tcq_cb<T, ne>(vx, dst, i0, d_turbo3_tcq_codebook);
 }
 
+// __forceinline__ sibling of dequantize_V_turbo3_tcq_cb above. Same body, same
+// math — only difference is inline policy. The 2-bit V variant
+// (`dequantize_V_turbo2_tcq_cb`) is already `__forceinline__` and compiles
+// cleanly, suggesting the 3-bit __noinline__ workaround was inherited "out of
+// caution" rather than empirically required for V dequant. Used by fattn-vec
+// V-accumulation in the same-type (turbo3_tcq × turbo3_tcq) FA TU, where
+// type_V==TURBO3_TCQ only co-occurs with type_K==TURBO3_TCQ in current builds.
+// Mixed-pair instances (e.g. K=turbo3_tcq, V=q8_0) never reach the
+// turbo3_tcq V branch, so they're unaffected. If a future build enables
+// q4_0×turbo3_tcq or similar, gate this call on the joint (type_K, type_V)
+// condition in fattn-vec.cuh and verify that TU still compiles.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_tcq_cb_inline(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0,
+        const float * __restrict__ cb) {
+    const block_turbo3_tcq * x = (const block_turbo3_tcq *) vx;
+    const int64_t ib = i0 / QK_TURBO3_TCQ;
+    const int     j0 = (int)(i0 % QK_TURBO3_TCQ);
+    const float norm = __half2float(x[ib].norm) * d_tcq_decode_alpha_v_fattn;
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; l++) {
+        const int t = j0 + l;
+        const int bit_pos = t * 3;
+        const uint16_t raw = (uint16_t)x[ib].qs[bit_pos/8] | ((uint16_t)x[ib].qs[bit_pos/8 + 1] << 8);
+        const int state = (raw >> (bit_pos % 8)) & 0x1FF;
+        vals[l] = cb[state] * norm;
+    }
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        for (int l0 = 0; l0 < ne; l0 += 2)
+            ((half2 *)dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0+1]));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
+    } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
 // =====================================================================================
 // TCQ 2-bit V dequant: 8-bit state -> codebook lookup
 // =====================================================================================
