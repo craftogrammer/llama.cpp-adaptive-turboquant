@@ -14,10 +14,12 @@
 #include <cmath>
 
 // V-cache norm alpha: optional scaling applied at encode time.
-// Default 1.0f (no scaling) to preserve backward compatibility.
-// Set TURBO_NORM_ALPHA_V=1.04 for KLD-optimal quality at 2K context (turbo3/turbo2).
-// TCQ types use their own d_tcq_norm_alpha_v (1.04f) in turbo-tcq.cuh.
-static __constant__ float d_norm_alpha_v = 1.0f;
+// Default 1.04f matches the TCQ default (turbo-tcq.cuh:28) — the KLD-optimal
+// value calibrated on Qwen3 27B / 2K context for turbo3/turbo2 V quantization.
+// Override at runtime with TURBO_NORM_ALPHA_V=<value>; range 0 < alpha < 10.
+// AUDIT_FINDINGS.md Finding 7: aligns non-TCQ default with the TCQ convention
+// so users get the documented optimum without needing to set the env var.
+static __constant__ float d_norm_alpha_v = 1.04f;
 
 // turbo4 V-alpha: default 1.0f (no scaling) to preserve backward compatibility.
 // Set TURBO4_NORM_ALPHA_V=1.10 for calibrated quality improvement.
