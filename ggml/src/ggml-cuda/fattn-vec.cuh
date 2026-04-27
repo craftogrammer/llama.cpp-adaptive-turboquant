@@ -27,6 +27,14 @@ static __device__ int64_t      d_fattn_sink_ne0   = 0;
 // the start of each FA call, gated by env TURBO_SINK_DIAG.
 static __device__ unsigned long long d_fattn_sink_hits[TURBO_SINK_MAX_RANGES] = { 0 };
 
+// Host-toggled gate for the per-hit warp-sampled atomic in
+// fattn_sink_lookup_K_slow. Set to 1 once via cudaMemcpyToSymbol the first
+// time the dispatcher sees TURBO_SINK_DIAG=1; stays 1 for the process
+// lifetime (diag_hits is a one-time getenv-init static). When 0, the atomic
+// is skipped entirely so DIAG-off cost is one global int load per warp-sampled
+// hit instead of an atomic.
+static __device__ int d_fattn_sink_diag_enabled = 0;
+
 // Look up a fp16 K row across all active sink ranges. Returns nullptr if the
 // position is not in any range.
 //
@@ -48,7 +56,7 @@ static __device__ __noinline__ const half * fattn_sink_lookup_K_slow(int kv_pos)
             if (kv_pos >= (int)s && kv_pos < (int)(s + w)) {
                 const half * buf = d_fattn_sink_K_bufs[r];
                 if (buf == nullptr) return nullptr;
-                if ((threadIdx.x & 31) == 0) {
+                if ((threadIdx.x & 31) == 0 && d_fattn_sink_diag_enabled) {
                     atomicAdd(&d_fattn_sink_hits[r], 1ULL);
                 }
                 const int64_t row = (int64_t)kv_pos - s;
@@ -841,6 +849,15 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
         // gated by env so release perf is unchanged.
         static const bool diag_hits = (std::getenv("TURBO_SINK_DIAG") != nullptr);
         if (diag_hits) {
+            // Push the device-side gate to 1 once per TU lifetime so the
+            // warp-sampled atomic in fattn_sink_lookup_K_slow becomes active.
+            // Without this, h_hits below would always read back zero.
+            static bool diag_flag_pushed = false;
+            if (!diag_flag_pushed) {
+                int one = 1;
+                CUDA_CHECK(cudaMemcpyToSymbol(d_fattn_sink_diag_enabled, &one, sizeof(one), 0, cudaMemcpyHostToDevice));
+                diag_flag_pushed = true;
+            }
             extern unsigned long long g_fattn_sink_hits_accum[TURBO_SINK_MAX_RANGES];
             unsigned long long h_hits[TURBO_SINK_MAX_RANGES] = { 0 };
             CUDA_CHECK(cudaMemcpyFromSymbol(h_hits, d_fattn_sink_hits, sizeof(h_hits), 0, cudaMemcpyDeviceToHost));
