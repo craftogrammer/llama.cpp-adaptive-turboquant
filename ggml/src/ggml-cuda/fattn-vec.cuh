@@ -1,14 +1,71 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "turbo-sink.cuh"
+
+#include <cstdlib>
 
 // Per-TU sink state — in fattn-vec.cuh so kernel and host code share the same TU copy.
 // Only K sinks are used in the VEC kernel. V sinks were removed from the V accumulation
 // loop because managed memory reads in the hot loop caused -3% short / -12% 32K regression.
-// Uses __device__ + cudaMemcpyToSymbolAsync (stream-ordered, graph-capturable).
+// Uses __device__ + cudaMemcpyAsync (stream-ordered, graph-capturable).
 // Previous __managed__ approach crashed on SM86 (page faults during graph replay).
-static __device__ const half * d_fattn_sink_K_buf = nullptr;
-static __device__ int          d_fattn_sink_n     = 0;
+//
+// Multi-range support: TURBO_SINK_MAX_RANGES slots. Slot 0 is the static base
+// [0, TURBO_SINK_SIZE); slots 1..MAX-1 are dynamic ranges registered by the
+// server's <think>-detection hook. A range with width==0 is inactive and is
+// skipped by the per-K-position check.
+static __device__ const half * d_fattn_sink_K_bufs[TURBO_SINK_MAX_RANGES] = { nullptr };
+static __device__ int64_t      d_fattn_sink_starts[TURBO_SINK_MAX_RANGES] = { 0 };
+static __device__ int          d_fattn_sink_widths[TURBO_SINK_MAX_RANGES] = { 0 };
+static __device__ int          d_fattn_sink_count = 0;
 static __device__ int64_t      d_fattn_sink_ne0   = 0;
+
+// Per-range hit counter, sampled at warp granularity (only thread 0 of each
+// warp increments) so atomics don't dominate the FA hot path.
+// Per-TU static — read back by the per-TU dispatcher into a process-global
+// host accumulator (g_fattn_sink_hits_accum, defined in turbo-sink.cu) at
+// the start of each FA call, gated by env TURBO_SINK_DIAG.
+static __device__ unsigned long long d_fattn_sink_hits[TURBO_SINK_MAX_RANGES] = { 0 };
+
+// Look up a fp16 K row across all active sink ranges. Returns nullptr if the
+// position is not in any range.
+//
+// __noinline__: ptxas on Windows + nvcc 12.9 + sm_120 trips ACCESS_VIOLATION
+// when this body is inlined into the mixed-pair FA TUs (turbo3_tcq×q8_0,
+// turbo3_0×q8_0). The fully-unrolled version of the same logic also crashes.
+// Same workaround pattern as vec_dot_fattn_vec_KQ_q4_0 / _turbo3_0 / _turbo3_tcq_decode.
+//
+// Cost: one function call per K-position attention check. For 64K-context
+// decode this is ~4M calls/token × ~5 cycles/call ≈ ~10 ms/token, but only
+// fires when at least one sink range is active (cheap early-out via
+// d_fattn_sink_count == 0 fast-path is folded into the call site to keep
+// the no-sink hot path identical to before this change).
+static __device__ __noinline__ const half * fattn_sink_lookup_K_slow(int kv_pos) {
+    for (int r = 0; r < TURBO_SINK_MAX_RANGES; ++r) {
+        const int w = d_fattn_sink_widths[r];
+        if (w > 0) {
+            const int64_t s = d_fattn_sink_starts[r];
+            if (kv_pos >= (int)s && kv_pos < (int)(s + w)) {
+                const half * buf = d_fattn_sink_K_bufs[r];
+                if (buf == nullptr) return nullptr;
+                if ((threadIdx.x & 31) == 0) {
+                    atomicAdd(&d_fattn_sink_hits[r], 1ULL);
+                }
+                const int64_t row = (int64_t)kv_pos - s;
+                return buf + row * d_fattn_sink_ne0;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Inline fast-path wrapper. The early-out keeps the no-sink hot path
+// identical to the pre-multi-range cost (one int compare + branch). When
+// ranges ARE active, dispatches to the __noinline__ slow path.
+static __device__ __forceinline__ const half * fattn_sink_lookup_K(int kv_pos) {
+    if (d_fattn_sink_count == 0) return nullptr;
+    return fattn_sink_lookup_K_slow(kv_pos);
+}
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -352,9 +409,10 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
                               type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO1_5) {
                     const int kv_pos = k_VKQ_0 + i_KQ;
-                    if (d_fattn_sink_n > 0 && kv_pos < d_fattn_sink_n && d_fattn_sink_K_buf != nullptr) {
+                    const half * sink_row = fattn_sink_lookup_K(kv_pos);
+                    if (sink_row != nullptr) {
                         const int kv_head = head / gqa_ratio;
-                        const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
+                        const char * sink_K = (const char *)(sink_row + kv_head * D);
                         sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
                     } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
                         sum = vec_dot_fattn_vec_KQ_turbo3_0_lean<D, nthreads_KQ>(
@@ -363,12 +421,13 @@ static __global__ void flash_attn_ext_vec(
                         sum = get_vec_dot_KQ_fattn<type_K, D, nthreads_KQ>()(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
                     }
                 } else if constexpr (type_K == GGML_TYPE_TURBO3_TCQ) {
-                    // Sink fast-path: positions < TURBO_SINK_SIZE use captured fp16 K
-                    // (matches turbo3_0 pattern at the top of this if/else chain).
+                    // Sink fast-path: any active sink range (base [0, TURBO_SINK_SIZE)
+                    // OR a dynamic <think>-anchor range) uses captured fp16 K.
                     const int kv_pos = k_VKQ_0 + i_KQ;
-                    if (d_fattn_sink_n > 0 && kv_pos < d_fattn_sink_n && d_fattn_sink_K_buf != nullptr) {
+                    const half * sink_row = fattn_sink_lookup_K(kv_pos);
+                    if (sink_row != nullptr) {
                         const int kv_head = head / gqa_ratio;
-                        const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
+                        const char * sink_K = (const char *)(sink_row + kv_head * D);
                         sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
                     } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
                         // Same-type TU: ptxas tolerates inlining the lean (unroll-1)
@@ -383,9 +442,10 @@ static __global__ void flash_attn_ext_vec(
                     }
                 } else if constexpr (type_K == GGML_TYPE_TURBO2_TCQ) {
                     const int kv_pos = k_VKQ_0 + i_KQ;
-                    if (d_fattn_sink_n > 0 && kv_pos < d_fattn_sink_n && d_fattn_sink_K_buf != nullptr) {
+                    const half * sink_row = fattn_sink_lookup_K(kv_pos);
+                    if (sink_row != nullptr) {
                         const int kv_head = head / gqa_ratio;
-                        const char * sink_K = (const char *)(d_fattn_sink_K_buf + kv_pos * d_fattn_sink_ne0 + kv_head * D);
+                        const char * sink_K = (const char *)(sink_row + kv_head * D);
                         sum = vec_dot_fattn_vec_KQ_f16<D, nthreads_KQ>(sink_K, Q_reg[j], Q_i32[j], Q_ds[j]);
                     } else {
                         if constexpr (type_V == GGML_TYPE_Q8_0) {
@@ -720,37 +780,77 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     if constexpr (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
                   type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO1_5 ||
                   type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ) {
-        const int ss = turbo_sink_size();
-        if (ss > 0) {
-            const ggml_tensor * K = dst->src[1];
-            int64_t k_ne0_full = 0;
-            half * k_buf = turbo_sink_lookup_buf((void *)K->data, &k_ne0_full);
-            const half * k_buf_const = k_buf;
+        const ggml_tensor * K = dst->src[1];
 
-            // Get device addresses once (cached per TU via static locals)
-            static void * d_addr_buf = nullptr;
-            static void * d_addr_n   = nullptr;
-            static void * d_addr_ne0 = nullptr;
-            if (!d_addr_buf) {
-                CUDA_CHECK(cudaGetSymbolAddress(&d_addr_buf, d_fattn_sink_K_buf));
-                CUDA_CHECK(cudaGetSymbolAddress(&d_addr_n,   d_fattn_sink_n));
-                CUDA_CHECK(cudaGetSymbolAddress(&d_addr_ne0, d_fattn_sink_ne0));
-            }
+        // Snapshot all currently-active sink ranges (base + dynamic) for THIS tensor.
+        // The canonical ne0 comes from the buffer entry (allocated at write time);
+        // it equals the row stride in halfs that the capture kernel wrote with.
+        turbo_sink_range_view ranges[TURBO_SINK_MAX_RANGES];
+        int64_t k_ne0_full = 0;
+        const int n_ranges = turbo_sink_collect_active_ranges_K((void *)K->data, ranges, &k_ne0_full);
 
-            // cudaMemcpyAsync is graph-capturable (unlike cudaMemcpyToSymbolAsync).
-            // Use aligned struct — unaligned stack vars cause segfault on SM89 (Ada)
-            // for certain sink sizes {1, 4, 16} due to L1 cache coherency issues.
-            struct __align__(16) sink_async_state {
-                const half * buf;
-                int64_t      ne0;
-                int          n;
-            };
-            static sink_async_state sink_state;
-            sink_state = {k_buf_const, k_ne0_full, ss};
-            CUDA_CHECK(cudaMemcpyAsync(d_addr_buf, &sink_state.buf, sizeof(const half *), cudaMemcpyHostToDevice, ctx.stream()));
-            CUDA_CHECK(cudaMemcpyAsync(d_addr_ne0, &sink_state.ne0, sizeof(int64_t),      cudaMemcpyHostToDevice, ctx.stream()));
-            CUDA_CHECK(cudaMemcpyAsync(d_addr_n,   &sink_state.n,   sizeof(int),          cudaMemcpyHostToDevice, ctx.stream()));
+        // Always upload (even when n_ranges == 0) so a previously-active count
+        // is correctly cleared on the device. The cost is ~50 bytes per FA call
+        // and the cudaMemcpyAsync is graph-capturable.
+        static void * d_addr_bufs   = nullptr;
+        static void * d_addr_starts = nullptr;
+        static void * d_addr_widths = nullptr;
+        static void * d_addr_count  = nullptr;
+        static void * d_addr_ne0    = nullptr;
+        if (!d_addr_bufs) {
+            CUDA_CHECK(cudaGetSymbolAddress(&d_addr_bufs,   d_fattn_sink_K_bufs));
+            CUDA_CHECK(cudaGetSymbolAddress(&d_addr_starts, d_fattn_sink_starts));
+            CUDA_CHECK(cudaGetSymbolAddress(&d_addr_widths, d_fattn_sink_widths));
+            CUDA_CHECK(cudaGetSymbolAddress(&d_addr_count,  d_fattn_sink_count));
+            CUDA_CHECK(cudaGetSymbolAddress(&d_addr_ne0,    d_fattn_sink_ne0));
         }
+
+        // Aligned static staging — unaligned stack vars caused SM89 segfault
+        // historically (preserved from the original impl).
+        struct __align__(16) sink_upload_state {
+            const half * bufs   [TURBO_SINK_MAX_RANGES];
+            int64_t      starts [TURBO_SINK_MAX_RANGES];
+            int          widths [TURBO_SINK_MAX_RANGES];
+            int          count;
+            int64_t      ne0;
+        };
+        static sink_upload_state ust;
+        for (int r = 0; r < TURBO_SINK_MAX_RANGES; ++r) {
+            if (r < n_ranges) {
+                ust.bufs[r]   = ranges[r].K_buf;
+                ust.starts[r] = ranges[r].start;
+                ust.widths[r] = ranges[r].width;
+            } else {
+                ust.bufs[r]   = nullptr;
+                ust.starts[r] = 0;
+                ust.widths[r] = 0;
+            }
+        }
+        ust.count = n_ranges;
+        ust.ne0   = k_ne0_full;
+
+        cudaStream_t stream = ctx.stream();
+        CUDA_CHECK(cudaMemcpyAsync(d_addr_bufs,   ust.bufs,    sizeof(ust.bufs),    cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_addr_starts, ust.starts,  sizeof(ust.starts),  cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_addr_widths, ust.widths,  sizeof(ust.widths),  cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_addr_count, &ust.count,   sizeof(ust.count),   cudaMemcpyHostToDevice, stream));
+
+        // DIAGNOSTIC (env TURBO_SINK_DIAG=1): read back this TU's hit counter,
+        // accumulate into the process-global host counter (defined in
+        // turbo-sink.cu), then zero the device counter. One sync per FA call —
+        // gated by env so release perf is unchanged.
+        static const bool diag_hits = (std::getenv("TURBO_SINK_DIAG") != nullptr);
+        if (diag_hits) {
+            extern unsigned long long g_fattn_sink_hits_accum[TURBO_SINK_MAX_RANGES];
+            unsigned long long h_hits[TURBO_SINK_MAX_RANGES] = { 0 };
+            CUDA_CHECK(cudaMemcpyFromSymbol(h_hits, d_fattn_sink_hits, sizeof(h_hits), 0, cudaMemcpyDeviceToHost));
+            for (int i = 0; i < TURBO_SINK_MAX_RANGES; ++i) {
+                g_fattn_sink_hits_accum[i] += h_hits[i];
+            }
+            unsigned long long zeros[TURBO_SINK_MAX_RANGES] = { 0 };
+            CUDA_CHECK(cudaMemcpyToSymbol(d_fattn_sink_hits, zeros, sizeof(zeros), 0, cudaMemcpyHostToDevice));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_addr_ne0,   &ust.ne0,     sizeof(ust.ne0),     cudaMemcpyHostToDevice, stream));
     }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

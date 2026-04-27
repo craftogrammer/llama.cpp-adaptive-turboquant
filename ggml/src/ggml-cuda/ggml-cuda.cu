@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-turbo-sink-trigger.h"
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -3045,6 +3046,27 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    // TurboQuant: detect anchor-registry mutations between captures. The FA
+    // dispatcher's host-side population of the per-call cudaMemcpyAsync source
+    // buffer only re-runs when the graph is being captured/recaptured (see
+    // ggml_cuda_graph_evaluate_and_capture). graph_node_properties_match does
+    // not see __device__ vars or process-global registry state, so a `<think>`
+    // registration after capture would otherwise be invisible until something
+    // else triggers a recapture. The revision counter solves that.
+    {
+        const int64_t cur_rev = ggml_cuda_turbo_sink_get_anchor_revision();
+        if (graph->last_anchor_revision != cur_rev) {
+            if (graph->last_anchor_revision >= 0) {
+                // Skip the first-call seed; only count actual mutations.
+                ggml_cuda_turbo_sink_note_recapture();
+                GGML_LOG_DEBUG("[turbo] anchor revision changed (%lld -> %lld), forcing graph recapture\n",
+                    (long long)graph->last_anchor_revision, (long long)cur_rev);
+            }
+            graph->last_anchor_revision = cur_rev;
+            res = true;
+        }
+    }
 
     // Check if the graph size has changed
     if (graph->props.size() != (size_t)cgraph->n_nodes) {

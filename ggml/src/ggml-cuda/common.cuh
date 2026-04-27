@@ -1169,6 +1169,14 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     std::vector<ggml_cuda_graph_node_properties> props;
 
+    // TurboQuant: revision counter snapshot for the dynamic fp16 sink registry.
+    // The dispatcher's host code writes the per-FA cudaMemcpyAsync source buffer,
+    // and that host code only re-runs when the graph is being captured/recaptured.
+    // If the registry mutates between captures, the old captured cudaMemcpyAsync
+    // would upload stale `count`. Comparing this against the current process-global
+    // anchor revision in graph_update_required forces a recapture on registry changes.
+    int64_t last_anchor_revision = -1;
+
     // these are extra tensors (inputs) that participate in the ggml graph but are not nodes
     // they properties also have to match in order to be able to safely reuse a CUDA graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18583

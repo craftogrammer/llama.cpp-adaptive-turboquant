@@ -23,6 +23,15 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# TurboQuant: when the CUDA backend is being built, link server-context against
+# the ggml-cuda target so the <think>-trigger hook (ggml_cuda_turbo_register_*)
+# resolves at link time. Define GGML_TURBOQUANT_CUDA_LINKED so server-context.cpp
+# uses the real extern decls instead of the no-op fallbacks.
+if (TARGET ggml-cuda)
+    target_link_libraries(${TARGET} PUBLIC ggml-cuda)
+    target_compile_definitions(${TARGET} PUBLIC GGML_TURBOQUANT_CUDA_LINKED)
+endif()
+
 
 # llama-server executable
 

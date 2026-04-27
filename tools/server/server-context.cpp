@@ -32,6 +32,39 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// TurboQuant: server-side hook into the CUDA backend's dynamic fp16 sink range
+// registry. Resolved at link time when the CUDA backend is built; the
+// GGML_TURBOQUANT_CUDA_LINKED define is set by tools/server/CMakeLists.txt
+// when ggml-cuda is part of the build. Non-CUDA builds use no-op fallbacks.
+#if defined(GGML_TURBOQUANT_CUDA_LINKED)
+#include "ggml-turbo-sink-trigger.h"
+#else
+static inline void ggml_cuda_turbo_register_thinking_anchor(int64_t /*pos*/, int /*width*/) {}
+static inline void ggml_cuda_turbo_clear_thinking_anchors(void) {}
+static inline int  ggml_cuda_turbo_thinking_anchor_count(void) { return 0; }
+static inline unsigned long long ggml_cuda_turbo_sink_get_capture_writes(void) { return 0; }
+static inline unsigned long long ggml_cuda_turbo_sink_get_fa_hits(int /*range_idx*/) { return 0; }
+static inline void               ggml_cuda_turbo_sink_reset_diagnostics(void) {}
+static inline int64_t            ggml_cuda_turbo_sink_get_anchor_revision(void) { return 0; }
+static inline int64_t            ggml_cuda_turbo_sink_get_recapture_count(void) { return 0; }
+static inline void               ggml_cuda_turbo_sink_note_recapture(void) {}
+#endif
+
+// Anchor width for the dynamic fp16 sink range registered on the first
+// reasoning token. Resolved at runtime from env TURBO_THINK_SINK_WIDTH
+// (default 8, clamped to [1, 64] inside the CUDA backend). Pulled into
+// a thread-safe cached static on first use to avoid per-token getenv cost.
+static int turbo_thinking_anchor_width() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * e = std::getenv("TURBO_THINK_SINK_WIDTH");
+        cached = e ? std::atoi(e) : 8;
+        if (cached < 1)  cached = 1;
+        if (cached > 64) cached = 64;
+    }
+    return cached;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -92,6 +125,14 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    // TurboQuant: set when this slot has emitted the model's reasoning open
+    // tag (e.g. "<think>") for the current task and we've already pushed a
+    // dynamic fp16 sink range covering the opening reasoning tokens. Reset
+    // in slot.reset() so the next task gets its own anchor. Single-shot per
+    // task; multi-`<think>`-block tasks fall back to the base sink range
+    // (extending coverage would need additional registrations, currently
+    // bounded by TURBO_SINK_MAX_RANGES-1 = 3 dynamic slots).
+    bool turbo_thinking_anchor_armed = false;
 
     stop_type stop;
 
@@ -136,6 +177,12 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         prompt.tokens.clear();
+
+        // TurboQuant: KV positions just got invalidated; any dynamic fp16 sink
+        // ranges anchored to old positions are now stale. Drop them and re-arm
+        // the thinking-anchor detector for whatever task fills this slot next.
+        turbo_thinking_anchor_armed = false;
+        ggml_cuda_turbo_clear_thinking_anchors();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -176,6 +223,13 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+
+        // TurboQuant: re-arm thinking-anchor detection for the next task and
+        // drop any dynamic fp16 sink ranges from the previous task. The base
+        // [0, TURBO_SINK_SIZE) range is preserved (it's controlled by the
+        // env var, not by per-task state).
+        turbo_thinking_anchor_armed = false;
+        ggml_cuda_turbo_clear_thinking_anchors();
 
         drafted.clear();
         i_batch_dft.clear();
@@ -400,6 +454,21 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // TurboQuant diagnostic dump: capture writes + per-range FA hits.
+        // Counters are process-global (shared across all FA-vec TUs) and are
+        // reset only via ggml_cuda_turbo_sink_reset_diagnostics(). Slot 0 is
+        // the base [0, TURBO_SINK_SIZE); slots 1..MAX-1 are dynamic anchors.
+        const unsigned long long cap_w = ggml_cuda_turbo_sink_get_capture_writes();
+        const unsigned long long h0 = ggml_cuda_turbo_sink_get_fa_hits(0);
+        const unsigned long long h1 = ggml_cuda_turbo_sink_get_fa_hits(1);
+        const unsigned long long h2 = ggml_cuda_turbo_sink_get_fa_hits(2);
+        const unsigned long long h3 = ggml_cuda_turbo_sink_get_fa_hits(3);
+        const long long rev = (long long)ggml_cuda_turbo_sink_get_anchor_revision();
+        const long long rec = (long long)ggml_cuda_turbo_sink_get_recapture_count();
+        SLT_INF(*this,
+                "turbo: sink diagnostics — capture_writes=%llu fa_hits[base=%llu, dyn1=%llu, dyn2=%llu, dyn3=%llu] anchor_rev=%lld graph_recaptures=%lld\n",
+                (unsigned long long)cap_w, h0, h1, h2, h3, rev, rec);
     }
 
     json to_json(bool only_metrics = false) const {
@@ -1243,6 +1312,45 @@ private:
             slot.add_token(result);
             if (slot.task->params.stream) {
                 send_partial_response(slot, result, false);
+            }
+
+            // TurboQuant: pin the model's reasoning-opening tokens at fp16.
+            //
+            // Trigger: fires once per task on the FIRST sampled token, when
+            // the task is in a thinking-format mode. The model's first
+            // sampled token IS the first reasoning content position (the
+            // chat template prepends "<think>\n" to the assistant turn, so
+            // by the time the model samples its first token, it's already
+            // semantically inside the reasoning block).
+            //
+            // Position semantics: at the FIRST process_token call, the
+            // just-sampled token has NOT yet been pushed to slot.prompt.tokens
+            // — that push happens in update_slots before the NEXT decode
+            // (server-context.cpp line 2092). So:
+            //   slot.prompt.tokens.size() == position the just-sampled token's
+            //                                K/V will be written to on the
+            //                                next decode.
+            // Anchoring [pos, pos+width) where pos = slot.prompt.tokens.size()
+            // covers the first generated token's K/V plus the next (width-1)
+            // reasoning-opening tokens — the agenda-setting span that long
+            // reasoning later attends back to. The base [0, TURBO_SINK_SIZE)
+            // sink already covers the system-prompt opening; this complements
+            // it with a reasoning-opening anchor.
+            //
+            // Empirically verified in this session by stderr trace:
+            //   pos=1584 == 1584-token prompt → first gen position is 1584.
+            if (!slot.turbo_thinking_anchor_armed &&
+                slot.task &&
+                slot.task->params.chat_parser_params.reasoning_format != COMMON_REASONING_FORMAT_NONE &&
+                slot.n_decoded >= 1) {
+                slot.turbo_thinking_anchor_armed = true;
+                const int64_t anchor_pos = (int64_t) slot.prompt.tokens.size();
+                const int      anchor_w   = turbo_thinking_anchor_width();
+                ggml_cuda_turbo_register_thinking_anchor(anchor_pos, anchor_w);
+                SLT_INF(slot,
+                    "turbo: thinking-anchor armed at pos=%lld width=%d (active=%d)\n",
+                    (long long)anchor_pos, anchor_w,
+                    ggml_cuda_turbo_thinking_anchor_count());
             }
         }
 
