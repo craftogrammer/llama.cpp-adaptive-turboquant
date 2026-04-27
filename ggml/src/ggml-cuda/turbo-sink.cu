@@ -193,8 +193,22 @@ void ggml_cuda_turbo_register_thinking_anchor(int64_t pos, int width) {
     // (e.g. interleaved-thinking models) don't waste slots.
     for (auto & r : g_dynamic_ranges) {
         if (pos >= r.start && pos <= r.start + r.width) {
-            const int64_t end = std::max<int64_t>(r.start + r.width, pos + width);
+            const int     old_width = r.width;
+            const int64_t end       = std::max<int64_t>(r.start + r.width, pos + width);
             r.width = (int)std::min<int64_t>(end - r.start, TURBO_THINK_SINK_WIDTH_MAX);
+            if (r.width != old_width) {
+                // Coalescing actually grew the range — bump the revision so
+                // the CUDA graph layer recaptures and uploads the new width
+                // into d_fattn_sink_widths[]. Without this, captured FA reads
+                // would still see the OLD width and treat newly-anchored K
+                // positions as TCQ-quantized (silent quality regression on
+                // interleaved-thinking models that fire two <think> hooks).
+                const int64_t new_rev = g_anchor_revision.fetch_add(1, std::memory_order_release) + 1;
+                fprintf(stderr,
+                    "[turbo] thinking-anchor coalesced: pos=%lld width %d->%d (active=%d, rev=%lld)\n",
+                    (long long)pos, old_width, r.width, (int)g_dynamic_ranges.size(),
+                    (long long)new_rev);
+            }
             return;
         }
     }
