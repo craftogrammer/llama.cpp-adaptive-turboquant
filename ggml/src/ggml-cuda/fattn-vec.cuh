@@ -28,28 +28,37 @@ static __device__ int64_t      d_fattn_sink_ne0   = 0;
 static __device__ unsigned long long d_fattn_sink_hits[TURBO_SINK_MAX_RANGES] = { 0 };
 
 // Host-toggled gate for the per-hit warp-sampled atomic in
-// fattn_sink_lookup_K_slow. Set to 1 once via cudaMemcpyToSymbol the first
+// fattn_sink_lookup_K. Set to 1 once via cudaMemcpyToSymbol the first
 // time the dispatcher sees TURBO_SINK_DIAG=1; stays 1 for the process
 // lifetime (diag_hits is a one-time getenv-init static). When 0, the atomic
 // is skipped entirely so DIAG-off cost is one global int load per warp-sampled
 // hit instead of an atomic.
 static __device__ int d_fattn_sink_diag_enabled = 0;
 
-// Look up a fp16 K row across all active sink ranges. Returns nullptr if the
-// position is not in any range.
-//
-// __noinline__: ptxas on Windows + nvcc 12.9 + sm_120 trips ACCESS_VIOLATION
-// when this body is inlined into the mixed-pair FA TUs (turbo3_tcq×q8_0,
-// turbo3_0×q8_0). The fully-unrolled version of the same logic also crashes.
-// Same workaround pattern as vec_dot_fattn_vec_KQ_q4_0 / _turbo3_0 / _turbo3_tcq_decode.
-//
-// Cost: one function call per K-position attention check. For 64K-context
-// decode this is ~4M calls/token × ~5 cycles/call ≈ ~10 ms/token, but only
-// fires when at least one sink range is active (cheap early-out via
-// d_fattn_sink_count == 0 fast-path is folded into the call site to keep
-// the no-sink hot path identical to before this change).
-static __device__ __noinline__ const half * fattn_sink_lookup_K_slow(int kv_pos) {
-    for (int r = 0; r < TURBO_SINK_MAX_RANGES; ++r) {
+// Slot 0 is the static prefix sink, normally only the first few KV positions.
+// Keep it inline so the common "base sink only" case does not call the
+// multi-range slow path for every non-sink K position.
+static __device__ __forceinline__ const half * fattn_sink_lookup_K_base(int kv_pos) {
+    const int w = d_fattn_sink_widths[0];
+    if (w <= 0) return nullptr;
+
+    const int64_t s = d_fattn_sink_starts[0];
+    if (kv_pos < (int)s || kv_pos >= (int)(s + w)) return nullptr;
+
+    const half * buf = d_fattn_sink_K_bufs[0];
+    if (buf == nullptr) return nullptr;
+    if ((threadIdx.x & 31) == 0 && d_fattn_sink_diag_enabled) {
+        atomicAdd(&d_fattn_sink_hits[0], 1ULL);
+    }
+    const int64_t row = (int64_t)kv_pos - s;
+    return buf + row * d_fattn_sink_ne0;
+}
+
+// Dynamic anchor ranges are rare and remain in a noinline helper. Inlining the
+// full multi-range loop into the mixed-pair FA TUs crashes ptxas on Windows +
+// nvcc 12.9 + sm_120, so only the simple slot-0 check is inlined above.
+static __device__ __noinline__ const half * fattn_sink_lookup_K_dynamic_slow(int kv_pos) {
+    for (int r = 1; r < TURBO_SINK_MAX_RANGES; ++r) {
         const int w = d_fattn_sink_widths[r];
         if (w > 0) {
             const int64_t s = d_fattn_sink_starts[r];
@@ -67,12 +76,15 @@ static __device__ __noinline__ const half * fattn_sink_lookup_K_slow(int kv_pos)
     return nullptr;
 }
 
-// Inline fast-path wrapper. The early-out keeps the no-sink hot path
-// identical to the pre-multi-range cost (one int compare + branch). When
-// ranges ARE active, dispatches to the __noinline__ slow path.
+// Inline fast-path wrapper. When only the static prefix sink is active, this
+// returns nullptr after cheap inline checks instead of calling the noinline
+// dynamic-range helper for every K position.
 static __device__ __forceinline__ const half * fattn_sink_lookup_K(int kv_pos) {
     if (d_fattn_sink_count == 0) return nullptr;
-    return fattn_sink_lookup_K_slow(kv_pos);
+    const half * base = fattn_sink_lookup_K_base(kv_pos);
+    if (base != nullptr) return base;
+    if (d_fattn_sink_count <= 1) return nullptr;
+    return fattn_sink_lookup_K_dynamic_slow(kv_pos);
 }
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
@@ -442,8 +454,8 @@ static __global__ void flash_attn_ext_vec(
                         // body here, so call the __forceinline__ sibling and skip
                         // the per-K-position function-call overhead. Mixed-pair TUs
                         // (V=q8_0) fall through to the __noinline__ variant below.
-                        sum = vec_dot_fattn_vec_KQ_turbo3_tcq_decode_inline<D, nthreads_KQ>(
-                            K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        sum = vec_dot_fattn_vec_KQ_turbo3_tcq_decode_inline_qonly<D, nthreads_KQ>(
+                            K + i_KQ*nb11, Q_reg[j]);
                     } else {
                         sum = vec_dot_fattn_vec_KQ_turbo3_tcq_decode<D, nthreads_KQ>(
                             K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
@@ -850,7 +862,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
         static const bool diag_hits = (std::getenv("TURBO_SINK_DIAG") != nullptr);
         if (diag_hits) {
             // Push the device-side gate to 1 once per TU lifetime so the
-            // warp-sampled atomic in fattn_sink_lookup_K_slow becomes active.
+            // warp-sampled atomic in fattn_sink_lookup_K becomes active.
             // Without this, h_hits below would always read back zero.
             static bool diag_flag_pushed = false;
             if (!diag_flag_pushed) {
