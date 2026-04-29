@@ -253,9 +253,17 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
 
     float saved_norm = cost[0];
 
-    // Viterbi forward pass: double-buffered cost (1 sync/step)
-    // Backtrace in global memory: byte-packed, no nibble conflicts
-    uint8_t * bt = bt_buf + (int64_t)blockIdx.x * (128 * 512);
+    // Viterbi forward pass: double-buffered cost (1 sync/step).
+    // Backtrace in DYNAMIC SHARED MEMORY (128 × 512 = 64 KiB) — was global.
+    // Eliminates the GMEM round-trip for the sequential backtrack at line ~318
+    // (sid==0 reads bt[t] for t=127..0 with 511 idle threads); SMEM read is
+    // ~1 cycle vs ~30-400 cycle GMEM latency. Block-occupancy unchanged
+    // (__launch_bounds__(512, 1) already pinned 1 block/SM). Per-process opt-in
+    // for >48 KiB dynamic SMEM is set at the launch site via cudaFuncSetAttribute.
+    // Removes need for the ensure_tcq_bt_buf scratch allocator (was 128 MiB max);
+    // the bt_buf parameter is retained for ABI/symbol stability but unused here.
+    extern __shared__ uint8_t bt_smem[];
+    uint8_t * bt = bt_smem;
     cost[sid] = 0.0f;
     __syncthreads();
 

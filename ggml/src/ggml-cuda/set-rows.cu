@@ -1766,9 +1766,21 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
+            // Backtrace lives in dynamic SMEM inside the kernel (128 × 512 = 64 KiB).
+            // sm_120 per-block static SMEM cap is 48 KiB so we must opt-in to the
+            // 99 KiB dynamic-SMEM pool via cudaFuncSetAttribute. Per-process guard
+            // so the attribute is set once. min_blocks_per_sm=1 already enforced
+            // by __launch_bounds__, so the SMEM increase doesn't drop occupancy.
+            constexpr int kBtSmemBytes = 128 * 512;
+            static bool s_attr_set = false;
+            if (!s_attr_set) {
+                cudaFuncSetAttribute((const void*)k_set_rows_turbo3_tcq<idx_t>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, kBtSmemBytes);
+                s_attr_set = true;
+            }
             for (int64_t g = 0; g < ne_total_groups; g += max_groups_per_batch) {
                 const int64_t batch = std::min(max_groups_per_batch, ne_total_groups - g);
-                k_set_rows_turbo3_tcq<idx_t><<<(int)batch, 512, 0, stream>>>(
+                k_set_rows_turbo3_tcq<idx_t><<<(int)batch, 512, kBtSmemBytes, stream>>>(
                     src0_d, src1_d, (block_turbo3_tcq *)dst->data,
                     ne_total_groups, bt_buf, g,
                     ne00, ne01, ne02, ne10, ne11, ne12, ne13,

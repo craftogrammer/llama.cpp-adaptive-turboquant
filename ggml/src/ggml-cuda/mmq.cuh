@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "cp-async.cuh"
 #include "vecdotq.cuh"
 #include "mma.cuh"
 
@@ -3408,12 +3409,30 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#ifdef CP_ASYNC_AVAILABLE
+            // Replace the sync LDG → STS chain with cp.async to SMEM. Lets the
+            // GPU's async-copy hardware queue multiple loads in flight; the
+            // commit_group/wait_group pair drains before the consumer reads
+            // tile_y in vec_dot. SASS: LDGSTS instead of LDG+STS pair.
+            // Same logical sync semantics as the prior path (wait_group 0 +
+            // __syncthreads), so behavior is unchanged for non-Blackwell paths.
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                const unsigned smem_addr = ggml_cuda_cvta_generic_to_shared(&tile_y[l]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                    :: "r"(smem_addr), "l"(&by0[l]));
+            }
+            asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 0;\n");
+#else
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];
             }
+#endif
         }
 
         __syncthreads();
@@ -3424,12 +3443,24 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#ifdef CP_ASYNC_AVAILABLE
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                const unsigned smem_addr = ggml_cuda_cvta_generic_to_shared(&tile_y[l]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                    :: "r"(smem_addr), "l"(&by0[l]));
+            }
+            asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 0;\n");
+#else
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];
             }
+#endif
         }
 
         __syncthreads();

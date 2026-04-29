@@ -1292,10 +1292,20 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_decode_i
         const int byte_idx = bp0 >> 3;
         const int bit_off = bp0 & 7;
 
+        // 2-byte aligned wider load. Block layout: fp16 norm (offset 0) + qs
+        // (offset +2); block size 52 ≡ 0 mod 4 and KV buffer base is 256-byte
+        // aligned ⇒ qs satisfies addr%2 == 0. byte_idx is dynamic and odd as
+        // often as even, so qs+byte_idx itself is not 2-aligned — but qs+(byte_idx
+        // & ~1) IS. Compensate by shifting bitfield by byte_shift*8 ∈ {0,8}.
+        // Total bits used = bit_off + 8 + 12 ≤ 27, fits in u32. Compiles to
+        // 2× LDG.E.U16 instead of 4× LDG.E.U8.
+        const int byte_shift  = byte_idx & 1;
+        const int aligned_idx = byte_idx & ~1;
+        const int total_shift = bit_off + byte_shift * 8;
         uint32_t raw32;
-        ggml_cuda_memcpy_1<sizeof(uint32_t), 1>(&raw32, K_tcq[ib].qs + byte_idx);
-        const float k0 = d_turbo3_tcq_codebook[(raw32 >> bit_off)       & 0x1FF] * norm;
-        const float k1 = d_turbo3_tcq_codebook[(raw32 >> (bit_off + 3)) & 0x1FF] * norm;
+        ggml_cuda_memcpy_1<sizeof(uint32_t), 2>(&raw32, K_tcq[ib].qs + aligned_idx);
+        const float k0 = d_turbo3_tcq_codebook[(raw32 >> total_shift)       & 0x1FF] * norm;
+        const float k1 = d_turbo3_tcq_codebook[(raw32 >> (total_shift + 3)) & 0x1FF] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const float2 qf = __half22float2(((const half2 *) Q_v)[qi]);
