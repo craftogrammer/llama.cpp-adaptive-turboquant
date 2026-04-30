@@ -147,14 +147,77 @@ llama_kv_cache::llama_kv_cache(
             }
             return mode;
         }
-        if (type_v == GGML_TYPE_TURBO3_TCQ && hparams.n_layer >= 8) {
-            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo3_tcq-V (mode 13, opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-            return 13;
-        }
-        if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer >= 8) {
+        // turbo2: keep prior coarse default (no per-mode VRAM model measured for it).
+        if (type_v == GGML_TYPE_TURBO2_0 && n_kv_layers >= 8) {
             LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (mode 12, opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
             return 12;
         }
+        if (type_v != GGML_TYPE_TURBO3_TCQ || n_kv_layers < 8) {
+            return 0;
+        }
+        // turbo3_tcq auto-selector: pick the most aggressive layer-promotion mode
+        // that still fits in dedicated VRAM with a safety margin for compute peaks.
+        // Order of preference (TG benefit on RTX 5080 / Qwen3.6-27B-NEO IQ3_M @ d=65K):
+        //   mode 1  (K&V first4+last4 q8_0)  +35% TG   highest VRAM cost
+        //   mode 7  (K-only last8     q8_0)  +22% TG   ~half mode-1 cost
+        //   mode 13 (V-only first2+last2 q8_0) baseline lowest VRAM cost
+        // Estimator uses the same ggml_row_size formula the real allocator uses.
+        auto estimate_kv_bytes = [&](int mode) -> size_t {
+            size_t total = 0;
+            uint32_t ord = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; il++) {
+                if (!hparams.has_kv(il)) continue;
+                if (filter && !filter(il)) continue;
+                const uint32_t n_embd_k = hparams.n_embd_k_gqa(il);
+                const uint32_t n_embd_v = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+                ggml_type lk = type_k;
+                ggml_type lv = type_v;
+                bool promote_k = false, promote_v = false;
+                switch (mode) {
+                    case 1:  promote_k = promote_v = (ord < 4 || ord >= n_kv_layers - 4); break;
+                    case 7:  promote_k = (ord >= n_kv_layers - 8); break;
+                    case 13: promote_v = (ord < 2 || ord >= n_kv_layers - 2); break;
+                }
+                if (promote_k) lk = GGML_TYPE_Q8_0;
+                if (promote_v) lv = GGML_TYPE_Q8_0;
+                total += ggml_row_size(lk, n_embd_k) * kv_size;
+                if (!is_mla) total += ggml_row_size(lv, n_embd_v) * kv_size;
+                ord++;
+            }
+            return total * n_stream;
+        };
+        size_t free_vram = 0, total_vram = 0;
+        if (offload) {
+            for (uint32_t il = 0; il < hparams.n_layer; il++) {
+                if (!hparams.has_kv(il)) continue;
+                if (filter && !filter(il)) continue;
+                ggml_backend_dev_t dev = model.dev_layer(il);
+                if (dev) {
+                    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+                }
+                break;
+            }
+        }
+        if (free_vram == 0) {
+            LLAMA_LOG_INFO("llama_kv_cache: TCQ auto-selector falling back to mode 13 (no GPU memory probe)\n");
+            return 13;
+        }
+        // Safety margin for compute peaks (fattn intermediates, mmq tile_y, graph buffers).
+        // Empirical: ~1 GiB headroom keeps a 16 GiB card off the PCIe-spill cliff.
+        const size_t safety_margin = (size_t)1024 * 1024 * 1024;
+        const size_t budget = free_vram > safety_margin ? free_vram - safety_margin : 0;
+        const int candidates[] = {1, 7, 13};
+        for (int m : candidates) {
+            const size_t cost = estimate_kv_bytes(m);
+            if (cost <= budget) {
+                LLAMA_LOG_INFO("llama_kv_cache: TCQ auto-selected mode %d "
+                    "(KV %.0f MiB, free %.0f MiB, margin %.0f MiB; override: TURBO_LAYER_ADAPTIVE)\n",
+                    m, cost/1048576.0, free_vram/1048576.0, safety_margin/1048576.0);
+                return m;
+            }
+        }
+        LLAMA_LOG_WARN("llama_kv_cache: TCQ auto: VRAM tight (free %.0f MiB), disabling layer-adaptive\n",
+            free_vram/1048576.0);
         return 0;
     }();
 
