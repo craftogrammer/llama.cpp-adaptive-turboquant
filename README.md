@@ -129,6 +129,37 @@ PCIe Gen 5 x16 hits ~89% saturation during MoE decode (56–61 GB/s burst agains
 
 I also profiled the dense 27B SHIP path with `ncu`: `mul_mat_q<IQ3_S>` is the hot kernel and is **register-bound** (254 regs/thread, ~12.5% theoretical occupancy, DRAM throughput <7%). Validated that `cp.async` / prefetch tricks don't help in this regime — they address memory latency that doesn't exist here.
 
+### Scaling Up to More VRAM (24 GB / 32 GB / 48 GB / 80 GB)
+
+The fork is tuned on 16 GB but the auto-selector and MoE-offload paths scale cleanly upward. I haven't measured these myself — the numbers below are *expected* behavior based on how the auto-selector and `--n-cpu-moe` cliff work. PRs with measured runs from bigger cards are welcome.
+
+**Dense 27B / 32B with bigger quants.** On 16 GB, IQ3_M was the largest dense quant that fits at 128K. With more VRAM the quant ladder opens up:
+
+| Card | Dense quant headroom at 128K |
+|---|---|
+| RTX 5080 16 GB | IQ3_M (12.0 GiB), UD-Q3_K_XL (13.5 GiB) — current ship |
+| RTX 5090 32 GB / RTX 4090 24 GB | Q4_K_M (15.7 GiB) and IQ4_XS (14.3 GiB) become comfortable; Q5_K_S / Q5_K_M plausible at 128K |
+| RTX 6000 Ada 48 GB / A6000 48 GB | Q6_K (~22 GiB) at 128K with full headroom; Q8_0 plausible at 64K |
+| A100 80 GB / H100 80 GB | Q8_0 dense at 128K with room for compute peak |
+
+**MoE 35B-A3B with less expert offload.** `--n-cpu-moe` is the bandwidth lever — every layer you keep on GPU eliminates that layer's PCIe traffic. APEX-I-Compact (16.10 GiB) on 16 GB needed `ncmoe=8`. With more VRAM:
+
+| Card | APEX-I-Compact `ncmoe` | Expected decode gain |
+|---|:---:|---|
+| 16 GB | 8 (current ship) | baseline |
+| 24 GB | 0–4 | ~30–50% higher decode at deep context (less PCIe traffic) |
+| 32 GB+ | 0 (fully on GPU) | PCIe stops being the bottleneck; you're back in pure compute regime |
+
+UD-Q4_K_XL (20.81 GiB) at `ncmoe=0` likewise becomes viable on a 24 GB card with room for KV at 128K, and on 32 GB with margin.
+
+**Auto-selector goes more aggressive automatically.** The `TURBO_LAYER_ADAPTIVE` auto-selector probes free VRAM at startup and picks the most aggressive K/V promotion mode that fits. On a 16 GB card it falls back to mode 13 past 96K; on 24/32/80 GB cards it should pick mode 1 (K&V first-4 + last-4 q8_0) at every depth — meaning the +35% TG win it delivers at d=65K on 16 GB carries through the entire depth sweep instead of degrading past 96K. No config change needed; the log line confirms which mode was picked:
+
+```
+llama_kv_cache: TCQ auto-selected mode 1 (KV 1510 MiB, free 28432 MiB, margin 1024 MiB)
+```
+
+If you run this fork on a bigger card, please open a PR or issue with `llama-bench -d 0,16384,32768,65536,98304,131072` for whichever model you tested and I'll roll the numbers into this README.
+
 ## Performance (RTX 5090, Qwen 3.5 27B Q6_K)
 
 | Type | Bits/Value | Compression | Short Decode | 32K Decode | PPL ctx=512 | PPL ctx=2048 |
