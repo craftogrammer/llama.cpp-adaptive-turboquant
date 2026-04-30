@@ -56,6 +56,79 @@ At short context, both builds are identical or near-identical. The advantage sho
 
 Built on signalnine's pre-rotate-queries architecture with parallel SET_ROWS, native Flash Attention vec_dot, and MMA prefill. All 4 turbo types with 36 asymmetric K/V combinations. Validated across 5 models, 4 GPUs, 1,351+ stability iterations with zero failures.
 
+## RTX 5080 16GB — What This Fork Was Tuned For
+
+All numbers below are from my own measurements on a single RTX 5080 16GB / Ryzen 9700X / 96 GB DDR5 / Windows 11 / CUDA 12.9.1 box. Measured with `llama-bench -d <depth>` (decode tg128 at the listed prompt depth), 3 reps each.
+
+### Dense Qwen3.6-27B (NEO-CODE IQ3_M, 12.0 GiB on disk)
+
+A coding-tuned IQ3_M quant of Qwen3.6-27B that fits comfortably at 128K context on 16 GB. KV layout is `turbo3_tcq` for K and V; the auto-selector picks `TURBO_LAYER_ADAPTIVE` per depth. Strong decode rate at low-to-mid context (where most editor sessions run) and graceful degrade past 96K — the second daily-driver alongside the MoE path; launch with `qwen-turbo.ps1`.
+
+| Context depth | Old path (mode 13) | Auto-selector (this fork) | Auto picks |
+|---:|---:|---:|:---:|
+| 0     | 40.5 | ~40   | mode 1  |
+| 16K   | 17.4 | ~26   | mode 1  |
+| 32K   | 10.6 | ~19   | mode 1  |
+| 65K   |  6.0 | **17.15** (+186%) | mode 1  |
+| 90K   |  —   | **13.56**         | mode 1  |
+| 131K  |  3.2 |  **7.30** (+128%) | mode 13 (auto falls back; mode 1 would PCIe-spill) |
+
+The big depth-jump win is the **VRAM-fit auto-selector**: at d=65K it correctly picks mode 1 (K&V first-4 + last-4 promoted to q8_0), which is +34.7% over the prior SHIP mode-13 baseline at the same depth. At d=131K mode 1 would PCIe-spill, so the auto-selector falls back to mode 13 — graceful degrade rather than a cliff.
+
+Estimate-vs-actual at d=65K: **1510 MiB predicted, 1509.88 MiB allocated** (the auto-selector uses the same `ggml_row_size` formula the allocator uses, so the budgeted size matches reality to ~0.01 MiB).
+
+VRAM at d=128K decode: ~14.4 / 16.0 GB (model 12.0 + KV 1.5 + compute peak ~1.0).
+
+### Sparse-MoE Qwen3.6-35B-A3B (APEX-I-Compact, 16.10 GiB on disk)
+
+35B total / 3B active, with `--n-cpu-moe 8` keeping the upper layers' experts on GPU and offloading the first 8 expert layers to CPU. KV layout is `turbo3_tcq` with the auto-selector enabled.
+
+| Context depth | Decode (t/s) | vs dense 27B at same depth |
+|---:|---:|---:|
+| 0     | **92.3** | +128% |
+| 16K   | **75.9** | +193% |
+| 32K   | **64.2** | +238% |
+| 65K   | **48.0** | +180% |
+| 128K  | **31.3** | +329% |
+
+This is the daily-driver config. ~30 t/s sustained at 128K context is what makes long-context coding-agent workflow actually usable on a 16GB card.
+
+VRAM at d=128K decode: ~13.3 / 16.0 GB (model on-GPU portion + KV + compute peak). PCIe Gen 5 x16 sits at ~89% saturation during decode (56–61 GB/s of 63 GB/s theoretical).
+
+### Why APEX-I-Compact is the SHIP MoE
+
+`--n-cpu-moe` has sharp phase cliffs. Sweep on UD-Q4_K_XL (20.81 GiB) at d=16K:
+
+| ncmoe | tg32 (t/s) | Notes |
+|---:|---:|---|
+| 40 (all CPU) | 36.4 | baseline |
+| 20           | 53.2 | safe |
+| 16           | **58.9** | sweet spot for the 21 GB file |
+| 12           | 36.1 | hit VRAM cliff |
+| 8            |  5.9 | catastrophic spill |
+
+APEX-I-Compact's smaller file (16.10 GiB vs 20.81 GiB) lets `ncmoe=8` fit, which reduces PCIe traffic enough to hit the higher decode rate above. APEX-I-Quality (Q6_K, 21.25 GiB) needed `ncmoe=20` and showed no quality win on a shared 11-test coding harness — dropped from rotation.
+
+### What Actually Fits on 16GB at 131K Context (dense 27B)
+
+| Quant | File size | Fits at 131K? |
+|---|---:|---|
+| NEO-CODE IQ3_M | 12.0 GiB | ✅ comfortably (~14.4 GB total with KV) |
+| UD-Q3_K_XL | 13.5 GiB | ✅ tight |
+| IQ4_XS | 14.3 GiB | ❌ ~1.6 GiB over |
+| Q4_K_S | 14.8 GiB | ❌ |
+| IQ4_NL | 15.0 GiB | ❌ |
+| Q4_K_M | 15.7 GiB | ❌ |
+| Q5 / Q6 | 19+ GiB | ❌ (5090 territory) |
+
+Every Q4-class quant and above is out of reach on dense 27B at usable 128K context on 16GB. IQ4_XS would need ~7 layers offloaded to CPU which kills decode to ~5 t/s. NEO-CODE IQ3_M was the dense-path ship pick; the 35B-A3B MoE path was added alongside it for cases where I wanted higher t/s at deep context.
+
+### Hardware Ceiling
+
+PCIe Gen 5 x16 hits ~89% saturation during MoE decode (56–61 GB/s burst against ~63 GB/s theoretical). SM utilization sits at 93–97%. Decode is bound by PCIe traffic from CPU-resident expert weights, not GPU compute. Getting past ~50 t/s sustained at long context on this stack would need more VRAM (fewer experts on CPU = less PCIe traffic), not more clever kernels.
+
+I also profiled the dense 27B SHIP path with `ncu`: `mul_mat_q<IQ3_S>` is the hot kernel and is **register-bound** (254 regs/thread, ~12.5% theoretical occupancy, DRAM throughput <7%). Validated that `cp.async` / prefetch tricks don't help in this regime — they address memory latency that doesn't exist here.
+
 ## Performance (RTX 5090, Qwen 3.5 27B Q6_K)
 
 | Type | Bits/Value | Compression | Short Decode | 32K Decode | PPL ctx=512 | PPL ctx=2048 |
