@@ -1,7 +1,10 @@
-# llama.cpp + TurboQuant + Adaptive Blackwell — Long-Context Coding on RTX 5080 16GB
+# llama.cpp-adaptive-turboquant
 
-A consumer-Blackwell-targeted llama.cpp fork. Builds on the TurboQuant KV-compression
-chain ([Google Research](https://arxiv.org/abs/2504.19874) → [TheTom](https://github.com/TheTom) → [signalnine](https://github.com/signalnine) → [@Madreag](https://github.com/Madreag)) and adds:
+A downstream fork of [Madreag/turbo3-cuda](https://github.com/Madreag/turbo3-cuda)
+and [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant), focused on adaptive KV
+layout selection, MoE partial offload, and long-context local coding workloads on consumer Blackwell GPUs.
+
+Lineage: [TurboQuant paper](https://arxiv.org/abs/2504.19874) (Google Research) → [TheTom](https://github.com/TheTom) → [signalnine](https://github.com/signalnine) → [@Madreag](https://github.com/Madreag) → this fork. What this layer adds:
 
 - **sm_120 (consumer Blackwell) ptxas-crash workarounds** for Windows nvcc 12.9
 - **TCQ (Trellis Coded Quantization)** integrated as a `turbo3_tcq` KV type
