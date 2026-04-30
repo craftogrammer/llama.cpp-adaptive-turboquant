@@ -1,8 +1,30 @@
-# llama.cpp + TurboQuant CUDA — Up to 8x KV Compression, Zero Speed Penalty
+# llama.cpp + TurboQuant + Adaptive Blackwell — Long-Context Coding on RTX 5080 16GB
 
-CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for llama.cpp, targeting NVIDIA GPUs (SM86+).
+A consumer-Blackwell-targeted llama.cpp fork. Builds on the TurboQuant KV-compression
+chain ([Google Research](https://arxiv.org/abs/2504.19874) → [TheTom](https://github.com/TheTom) → [signalnine](https://github.com/signalnine) → [@Madreag](https://github.com/Madreag)) and adds:
+
+- **sm_120 (consumer Blackwell) ptxas-crash workarounds** for Windows nvcc 12.9
+- **TCQ (Trellis Coded Quantization)** integrated as a `turbo3_tcq` KV type
+- **A VRAM-fit auto-selector** that probes free GPU memory and picks the most
+  aggressive layer-adaptive K/V promotion mode that fits (`mode 1 → 7 → 13 → off`)
+- **MoE offload tuning** — `--n-cpu-moe` sweep methodology and validated 16 GB configs
+  for Qwen3.6-35B-A3B
+- **Long-context depth-sweep validation** at d=0/16K/32K/65K/128K rather than d=0 only
+
+I tuned this for one specific stack (RTX 5080 16 GB / Ryzen 9700X / DDR5 / Windows 11),
+but the code paths apply to any sm_120 setup, and the build / run instructions below
+cover other system configurations.
+
+The original TurboQuant CUDA work — what makes the `turbo*` cache types fast at all —
+isn't mine. See [Acknowledgments](#acknowledgments-and-contributions).
+
+> **CUDA toolchain:** sm_120 builds require **CUDA 12.9.x**. I tested 13.x and it
+> produced garbage output; 13.1 segfaulted in MMQ kernels. CUDA 13 may fix this in
+> future releases — until then, pin 12.9.
 
 ## Why TurboQuant?
+
+CUDA implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression for llama.cpp, targeting NVIDIA GPUs (SM86+).
 
 The KV cache is the memory bottleneck for long-context LLM inference. At 32K+ tokens, the KV cache can exceed the model weights in size, consuming VRAM and bandwidth. TurboQuant compresses KV values from 8.5 bits (q8_0) down to 2-4 bits — **slashing memory 4-8x** while maintaining quality. The result: longer context, more concurrent users, and on bandwidth-limited GPUs, **faster decode**.
 
@@ -105,6 +127,154 @@ PPL impact: Q4_K_M + turbo3 = 7.127 (+1.39% vs q8_0 = 7.030). Safe on 27B+ model
 | **Quality-optimal asymmetric** | Q6_K weights + K=turbo4/V=q8_0 | `-m model-Q6_K.gguf -ctk turbo4 -ctv q8_0 -fa` |
 | **Maximum compression** | Q4_K_M weights + turbo1.5 KV | `-m model-Q4_K_M.gguf -ctk turbo1.5 -ctv turbo1.5 -fa` |
 | **Boundary V protection** | turbo2 V (auto-enabled) | `-m model.gguf -ctk turbo3 -ctv turbo2 -fa` (Boundary V activates automatically) |
+
+## Building
+
+The fork ships three PowerShell scripts at the repo root (`compile.ps1`, `qwen-turbo.ps1`,
+`qwen-moe-turbo.ps1`) that capture the exact configuration I run.
+They are starting points — adapt paths and flags for your system.
+
+### Path A — Windows + RTX 5080 / RTX 5090 (sm_120, the validated path)
+
+```powershell
+# Defaults: CUDA 12.9, sm_120, Ninja, parallel=4
+.\compile.ps1
+
+# Force a clean rebuild (e.g. after changing CUDA version)
+.\compile.ps1 -Clean
+```
+
+You'll need [Ninja](https://github.com/ninja-build/ninja/releases), CMake ≥ 3.18, the
+MSVC build tools, and **CUDA Toolkit 12.9.x**. Edit the top of `compile.ps1` if your
+nvcc lives somewhere else.
+
+### Path B — Linux + Blackwell (sm_120) / RTX 5090
+
+```bash
+cmake -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="120-real" \
+  -DGGML_CUDA_FA=ON \
+  -DGGML_CUDA_F16=ON \
+  -DGGML_CUDA_NO_MXFP4=ON \
+  -DLLAMA_CURL=OFF \
+  -DLLAMA_BUILD_SERVER=ON
+
+cmake --build build --target llama-server llama-cli llama-bench -j$(nproc)
+```
+
+`GGML_CUDA_NO_MXFP4=ON` is required on sm_120 — the consumer Blackwell silicon does
+not implement the MXFP4 PTX instructions, so leaving these kernels enabled fails to
+build (or builds and crashes ptxas on Windows).
+
+### Path C — Older CUDA arches (sm_86 Ampere / sm_89 Ada)
+
+The TCQ KV path and the auto-selector work on any CUDA arch the upstream TurboQuant
+fork supported. Build the same way as Path B, just point `CMAKE_CUDA_ARCHITECTURES` at
+your card and drop the `MXFP4` gate (it's only needed on sm_120):
+
+```bash
+# RTX 3090 / 3090 Ti
+-DCMAKE_CUDA_ARCHITECTURES="86-real"
+# RTX 4090 / 4090M
+-DCMAKE_CUDA_ARCHITECTURES="89-real"
+```
+
+The sm_120 ptxas workarounds (the `--ptxas-options=-O0` fallback for some `turbo3_*` TUs
+in `ggml/src/ggml-cuda/CMakeLists.txt`) are gated to sm_120 builds and don't slow down
+older arches.
+
+### Path D — CUDA 13 (not yet supported)
+
+Tested CUDA 13.x produces garbage output on sm_120 builds and 13.1 segfaults inside MMQ
+kernels. Stick to CUDA 12.9.x until upstream nvcc fixes the codegen issues. If you have
+a working CUDA-13 build on a different arch, please open an issue.
+
+## Running
+
+The two launcher scripts at the repo root document the validated runtime configurations
+on a 16 GB card. Both invoke `llama-server` on `127.0.0.1:8080` with a Claude-/OpenAI-
+compatible chat endpoint.
+
+### Dense Qwen3.6-27B (long context, agent workflow)
+
+```powershell
+.\qwen-turbo.ps1 -Model path\to\Qwen3.6-27B.gguf -Context 131072
+```
+
+Defaults: `--cache-type-k turbo3_tcq --cache-type-v turbo3_tcq`, the VRAM-fit auto-selector
+picks `TURBO_LAYER_ADAPTIVE` mode, attention sinks on, prompt cache enabled. Override
+with `-Fit` if you want llama.cpp's automatic CPU-offload-on-overflow behaviour;
+otherwise the script forces `-ngl 999` so OOM is the hard signal that you need a
+smaller context.
+
+### Sparse-MoE Qwen3.6-35B-A3B (16 GB ship config)
+
+```powershell
+.\qwen-moe-turbo.ps1 -Model path\to\Qwen3.6-35B-A3B-APEX-I-Compact.gguf -NCpuMoE 8
+```
+
+Pick `-NCpuMoE` to match your GGUF size on 16 GB:
+
+| GGUF size | `-NCpuMoE` | Notes |
+|---:|:---:|---|
+| ~16 GB Q4 (e.g. APEX-I-Compact) | **8** | validated SHIP, 30+ t/s @ d=128K |
+| ~21 GB Q4_K (e.g. UD-Q4_K_XL) | **16** | sweet spot for the heavier file |
+| ~21 GB Q6_K (e.g. APEX-I-Quality) | **20** | fits but no quality win on shared harness |
+
+The cliff is sharp. Going one step lower than the matched value spills VRAM and decode
+collapses (e.g. `ncmoe=8` on a 21 GB file → ~6 t/s).
+
+### Plain `llama-server` / `llama-cli` (any system)
+
+If you'd rather skip the launcher scripts and call llama.cpp directly:
+
+```bash
+# Dense, TCQ KV with auto-selector
+./build/bin/llama-server -m model.gguf \
+  -ngl 999 -c 131072 \
+  --flash-attn on \
+  --cache-type-k turbo3_tcq --cache-type-v turbo3_tcq \
+  --batch-size 2048 --ubatch-size 1024 \
+  --no-mmap --jinja --port 8080
+
+# MoE with expert offload
+./build/bin/llama-server -m model.gguf \
+  -ngl 999 --n-cpu-moe 8 -c 131072 \
+  --flash-attn on \
+  --cache-type-k turbo3_tcq --cache-type-v turbo3_tcq \
+  --no-mmap --port 8080
+```
+
+### Environment variables
+
+Optional knobs (set before launching the server):
+
+| Var | Default | Purpose |
+|---|---|---|
+| `TURBO_LAYER_ADAPTIVE` | auto-selected | Force a specific layer-adaptive mode (override the auto-selector). `0`=disable, `1`=K&V first4+last4 q8_0, `7`=K-only last8 q8_0, `13`=V-only first2+last2 q8_0 |
+| `TURBO_SINK_SIZE` | 0 | Number of leading tokens kept at fp16 as attention sinks (use `4` for chat templates with system tokens) |
+| `TURBO_NORM_ALPHA_V` | 1.04 | TurboQuant V-cache norm scaling (KLD-optimal for Qwen3 27B) |
+| `TURBO_TCQ_ALPHA_V` | 1.04 | TCQ-specific V-cache norm scaling |
+| `TURBO_INNERQ` / `TURBO_INNERQ_STRENGTH` | 4096 / 1.0 | InnerQ per-channel calibration window and mix |
+
+Look for `llama_kv_cache: TCQ auto-selected mode N (KV X MiB, free Y MiB, margin 1024 MiB)`
+in the server log to confirm the auto-selector picked a mode.
+
+### Claude Code / Anthropic-compatible clients
+
+The server speaks Anthropic's `/v1/messages` endpoint. Point any client that accepts
+`ANTHROPIC_BASE_URL` at it:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_API_KEY=anything
+claude            # or your Anthropic-SDK app
+```
+
+OpenAI-compatible (`/v1/chat/completions`) also works — see the existing llama.cpp
+server docs further down this README.
 
 ## Quick Start
 
@@ -305,7 +475,48 @@ q8_0 identical. Optimized turbo3 at ctx=2048 equals q8_0 exactly (5.6744 = 5.674
 
 ## Acknowledgments and Contributions
 
-### This Fork (Madreag)
+### This Layer — Adaptive Blackwell ([@craftogrammer](https://github.com/craftogrammer))
+
+Tuning + integration on top of Madreag's TurboQuant CUDA fork, focused on consumer
+Blackwell (sm_120, RTX 5080 16 GB) and long-context coding-agent workflow:
+
+**Blackwell silicon support:**
+- sm_120 + Windows nvcc 12.9 ptxas-crash workarounds (`__noinline__` on q4_0 / turbo3_tcq
+  helpers; `--ptxas-options=-O0` fallback for `turbo3_0` and `turbo3_tcq` TUs; `MXFP4`
+  paths gated behind `GGML_CUDA_NO_MXFP4`)
+- `wgmma` / `setmaxnreg` confirmed unavailable on consumer Blackwell; `cp.async`,
+  `mbarrier`, TMA, and `prefetch.global.L2` (lowers to `CCTL.E.PF2` SASS) verified
+  available
+- Pinned to `120-real` (avoid silent 12X→12Xa coercion that targets datacenter-only ops)
+
+**TCQ KV path:**
+- `turbo3_tcq` cache type integrated as a same-type and mixed-pair (`turbo3_tcq` ↔ `q8_0`)
+  attention path; D=128/256 dispatch; FWHT groups + attention-sink capture
+- Inline V dequantization + byte-pair vectorization in the same-type FA TU
+  (cumulative +5.1% / +9.9% / +13.0% TG at d=16K / 32K / 64K)
+- `K_set_rows` backtrace in dynamic SMEM (drops a 128 MiB scratch alloc)
+
+**Auto-selection + adaptive layout:**
+- VRAM-fit auto-selector in `llama-kv-cache.cpp` — probes `ggml_backend_dev_memory`,
+  estimates per-mode KV bytes with the same `ggml_row_size` formula the allocator uses,
+  picks the most aggressive `TURBO_LAYER_ADAPTIVE` mode that fits under free VRAM minus
+  1 GiB compute-peak margin; predicted-vs-actual 1510 / 1509.88 MiB at d=65K
+- Mode 1 (K&V first-4 + last-4 q8_0) → mode 7 (K-only last-8 q8_0) → mode 13
+  (V-only first-2 + last-2) → off cascade
+
+**MoE offload tuning:**
+- `--n-cpu-moe` sweep methodology validated for Qwen3.6-35B-A3B on 16 GB; APEX-I-Compact
+  (16 GB Q4) at `ncmoe=8` is the SHIP MoE config (~30 t/s @ d=128K)
+
+**Validation:**
+- Long-context depth-sweep harness at d=0/16K/32K/65K/128K (rather than the d=0-only
+  numbers most posts report)
+- ncu-profiled the SHIP decode path: `mul_mat_q<IQ3_S>` is register-bound (254 regs/thread,
+  ~12.5% theoretical occupancy) — validated that cp.async / prefetch tricks don't help
+- Dropped optimizations that didn't survive clean rebench (e.g. `TURBO_SPARSE_V_THRESHOLD`
+  runtime knob caused a 32% decode regression — reverted to `constexpr 1e-6f`)
+
+### Parent Fork (Madreag) — TurboQuant CUDA
 
 CUDA kernel optimizations, cross-GPU validation, and quality testing by [@Madreag](https://github.com/Madreag):
 
